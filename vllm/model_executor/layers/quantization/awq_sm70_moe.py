@@ -379,8 +379,6 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer._buf_output = torch.empty(
             persistent_tokens, hidden_size, dtype=torch.float16,
             device=device)
-        layer._buf_single_topk_ids_i64 = torch.empty(
-            top_k, dtype=torch.int64, device=device)
         layer._buf_single_w13_ptrs_w = torch.empty(
             top_k, layer.sm70_ptr_row_bytes, dtype=torch.uint8, device=device)
         layer._buf_single_w13_ptrs_s = torch.empty(
@@ -522,18 +520,6 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             return self._apply_batched(layer, x, topk_weights, topk_ids)
         return self._apply_sorted_loop(layer, x, topk_weights, topk_ids)
 
-    def _get_single_token_active_ids(
-        self,
-        layer: torch.nn.Module,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        active_ids = topk_ids.view(-1)
-        if active_ids.dtype == torch.int64:
-            return active_ids
-        single_topk_ids_i64 = layer._buf_single_topk_ids_i64
-        single_topk_ids_i64.copy_(active_ids, non_blocking=True)
-        return single_topk_ids_i64
-
     def _apply_single_token_compact(
         self,
         layer: torch.nn.Module,
@@ -548,14 +534,13 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         compact_input = buffers["permuted_input"][:top_k]
         intermediate = buffers["intermediate"][:top_k]
         sorted_output = buffers["sorted_output"][:top_k]
-        active_ids = self._get_single_token_active_ids(layer, topk_ids)
         inv_permuted_idx = layer._buf_single_inv_permuted_idx
 
         ops.awq_moe_single_token_sm70_out(
             output,
             x,
             topk_weights,
-            active_ids,
+            topk_ids,
             layer.w13_strided_ptrs_w_rows,
             layer.w13_strided_ptrs_s_rows,
             layer.w2_strided_ptrs_w_rows,
