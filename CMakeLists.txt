@@ -349,6 +349,63 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
     SRCS "${VLLM_EXT_SRC}"
     CUDA_ARCHS "${CUDA_ARCHS}")
 
+  #
+  # SM70 AWQ TurboMind kernels (V100).
+  # Prefer the checked-in lmdeploy source tree used by 1Cat; fall back to a
+  # stub build if the source tree is unavailable.
+  #
+  set(VLLM_TURBOMIND_ROOT "${CMAKE_CURRENT_LIST_DIR}/../1cat-vllm/lmdeploy")
+  if (NOT EXISTS "${VLLM_TURBOMIND_ROOT}/src/turbomind")
+    set(VLLM_TURBOMIND_ROOT "${CMAKE_CURRENT_LIST_DIR}/../lmdeploy")
+  endif()
+  cuda_archs_loose_intersection(AWQ_SM70_ARCHS "7.0" "${CUDA_ARCHS}")
+  if (AWQ_SM70_ARCHS)
+    if (EXISTS "${VLLM_TURBOMIND_ROOT}/src/turbomind")
+      set(VLLM_TURBOMIND_INCLUDE_DIRS "${VLLM_TURBOMIND_ROOT}")
+      set(AWQ_SM70_TURBOMIND_SRCS
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/core/check.cc"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/core/layout.cc"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/core/context.cc"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/core/allocator.cc"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/core/buffer.cc"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/core/stream.cc"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/utils/logger.cc"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/utils/parser.cc"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/gemm.cu"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/kernel.cu"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/dispatch_cache.cu"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/context.cu"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/convert_v3.cu"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/cast.cu"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/unpack.cu"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/tuner/cache_utils.cu"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/tuner/measurer.cu"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/tuner/sampler.cu"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/tuner/stopping_criterion.cc"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/tuner/params.cc"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_4.cu"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_16.cu"
+        "csrc/quantization/awq/tm_registry_sm70.cu"
+        "csrc/quantization/awq/awq_sm70_gemm.cu")
+      set_gencode_flags_for_srcs(
+        SRCS "${AWQ_SM70_TURBOMIND_SRCS}"
+        CUDA_ARCHS "${AWQ_SM70_ARCHS}")
+      list(APPEND VLLM_EXT_SRC "${AWQ_SM70_TURBOMIND_SRCS}")
+      list(APPEND VLLM_GPU_FLAGS "-DVLLM_HAS_SM70_AWQ=1")
+      message(STATUS "Building TurboMind SM70 AWQ kernels from ${VLLM_TURBOMIND_ROOT}")
+    else()
+      set(AWQ_SM70_STUB_SRCS
+        "csrc/quantization/awq/awq_sm70_stub.cu")
+      set_gencode_flags_for_srcs(
+        SRCS "${AWQ_SM70_STUB_SRCS}"
+        CUDA_ARCHS "${AWQ_SM70_ARCHS}")
+      list(APPEND VLLM_EXT_SRC "${AWQ_SM70_STUB_SRCS}")
+      message(WARNING
+        "TurboMind sources not found; building SM70 AWQ stub kernels. "
+        "SM70 AWQ will be unavailable at runtime.")
+    endif()
+  endif()
+
   # Only build Marlin kernels if we are building for at least some compatible archs.
   # Keep building Marlin for 9.0 as there are some group sizes and shapes that
   # are not supported by Machete yet.
@@ -948,6 +1005,7 @@ define_extension_target(
   ARCHITECTURES ${VLLM_GPU_ARCHES}
   INCLUDE_DIRECTORIES ${CUTLASS_INCLUDE_DIR}
   INCLUDE_DIRECTORIES ${CUTLASS_TOOLS_UTIL_INCLUDE_DIR}
+  INCLUDE_DIRECTORIES ${VLLM_TURBOMIND_INCLUDE_DIRS}
   USE_SABI 3
   WITH_SOABI)
 
