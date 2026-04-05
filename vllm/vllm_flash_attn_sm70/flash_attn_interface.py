@@ -44,6 +44,14 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _maybe_int32_contiguous(x):
+    if x is None:
+        return None
+    if x.dtype != torch.int32:
+        x = x.to(dtype=torch.int32)
+    return x.contiguous() if not x.is_contiguous() else x
+
+
 def _decode_num_splits() -> int:
     raw = os.environ.get("SM70_FLASH_ATTN_DECODE_NUM_SPLITS")
     if raw is None:
@@ -303,8 +311,8 @@ def flash_attn_decode_paged(
     q = maybe_contiguous(q)
     k_cache = maybe_contiguous(k_cache)
     v_cache = maybe_contiguous(v_cache)
-    block_table = maybe_contiguous(block_table)
-    seq_lens = maybe_contiguous(seq_lens)
+    block_table = _maybe_int32_contiguous(block_table)
+    seq_lens = _maybe_int32_contiguous(seq_lens)
     alibi_slopes = maybe_contiguous(alibi_slopes)
 
     if q.dim() == 3:
