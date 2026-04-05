@@ -56,6 +56,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+from vllm.model_executor.layers.utils import maybe_sm70_projection
 
 logger = init_logger(__name__)
 
@@ -503,16 +504,39 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # ============================================================
         if hasattr(self, "in_proj_qkv"):
             # LoRA path (Qwen3.5 only): separate in_proj_qkv and in_proj_z
-            mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
-            z, _ = self.in_proj_z(hidden_states)
+            projected = maybe_sm70_projection(self.in_proj_qkv, hidden_states)
+            if projected is None:
+                mixed_qkv, _ = self.in_proj_qkv(hidden_states)
+            else:
+                mixed_qkv, _ = projected
+
+            projected = maybe_sm70_projection(self.in_proj_ba, hidden_states)
+            if projected is None:
+                ba, _ = self.in_proj_ba(hidden_states)
+            else:
+                ba, _ = projected
+
+            projected = maybe_sm70_projection(self.in_proj_z, hidden_states)
+            if projected is None:
+                z, _ = self.in_proj_z(hidden_states)
+            else:
+                z, _ = projected
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
             a = a.contiguous()
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            projected = maybe_sm70_projection(self.in_proj_qkvz, hidden_states)
+            if projected is None:
+                mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            else:
+                mixed_qkvz, _ = projected
+
+            projected = maybe_sm70_projection(self.in_proj_ba, hidden_states)
+            if projected is None:
+                ba, _ = self.in_proj_ba(hidden_states)
+            else:
+                ba, _ = projected
 
             if self.gqa_interleaved_layout:
                 # Qwen3-Next: unpack the interleaved GQA layout
@@ -562,7 +586,10 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
-        output[:num_tokens], _ = self.out_proj(core_attn_out)
+        projected = maybe_sm70_projection(self.out_proj, core_attn_out)
+        if projected is None:
+            projected = self.out_proj(core_attn_out)
+        output[:num_tokens], _ = projected
 
     def _warmup_prefill_kernels(self, mixed_qkv: torch.Tensor) -> None:
         """Warm up GDN prefill kernels during V1 profiling.

@@ -54,6 +54,7 @@ from vllm.model_executor.models.qwen2_moe import Qwen2MoeMLP as Qwen3NextMLP
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
+from vllm.model_executor.layers.utils import maybe_sm70_projection
 
 from .interfaces import (
     HasInnerState,
@@ -282,7 +283,11 @@ class Qwen3NextAttention(nn.Module):
         output: torch.Tensor,
         hidden_states: torch.Tensor,
     ):
-        qkv, _ = self.qkv_proj(hidden_states)
+        projected = maybe_sm70_projection(self.qkv_proj, hidden_states)
+        if projected is None:
+            qkv, _ = self.qkv_proj(hidden_states)
+        else:
+            qkv, _ = projected
 
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -311,7 +316,10 @@ class Qwen3NextAttention(nn.Module):
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 
-        output[:], _ = self.o_proj(attn_output)
+        projected = maybe_sm70_projection(self.o_proj, attn_output)
+        if projected is None:
+            projected = self.o_proj(attn_output)
+        output[:], _ = projected
 
 
 class Qwen3NextDecoderLayer(nn.Module):

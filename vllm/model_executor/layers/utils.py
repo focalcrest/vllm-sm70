@@ -98,6 +98,49 @@ def default_unquantized_gemm(
     return torch.nn.functional.linear(x, weight, bias)
 
 
+def maybe_sm70_projection(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+    """Try the optional SM70 fp16 projection fast path.
+
+    The helper is a no-op unless the layer has been prepared by the SM70
+    custom op path and the underlying CUDA extension is available.
+    """
+    if not getattr(layer, "_sm70_f16_prepared", False):
+        return None
+
+    if not current_platform.is_cuda_alike():
+        return None
+
+    if not hasattr(torch.ops._C, "sm70_f16_gemm"):
+        return None
+
+    x_2d = x.reshape(-1, x.shape[-1])
+    if not x_2d.is_contiguous():
+        x_2d = x_2d.contiguous()
+
+    tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
+    k_ld = getattr(layer, "_sm70_f16_k_ld", None)
+    if tm_weight is not None and k_ld is not None:
+        output = torch.empty(
+            (x_2d.size(0), tm_weight.shape[0]),
+            dtype=x_2d.dtype,
+            device=x_2d.device,
+        )
+        ops.sm70_f16_gemm_out(output, x_2d, tm_weight, k_ld, False)
+    else:
+        output = torch.ops._C.sm70_f16_gemm(x_2d, layer.weight)
+    output = output.reshape(*x.shape[:-1], output.shape[-1])
+
+    if getattr(layer, "bias", None) is not None and not getattr(
+        layer, "skip_bias_add", False
+    ):
+        output = output + layer.bias
+    output_bias = layer.bias if getattr(layer, "skip_bias_add", False) else None
+    return output, output_bias
+
+
 def use_aiter_triton_gemm(n, m, k, dtype):
     if (
         not rocm_aiter_ops.is_triton_gemm_enabled()

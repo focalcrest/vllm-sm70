@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -8,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from vllm import _custom_ops as ops
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -20,12 +22,39 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
     method_has_implemented_embedding,
 )
-from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
+from vllm.model_executor.layers.utils import (
+    dispatch_unquantized_gemm,
+    maybe_sm70_projection,
+)
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
+SM70_LM_HEAD_FASTPATH_ENABLED = (
+    os.getenv("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", "1") == "1"
+)
+
+
+def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
+    if not SM70_LM_HEAD_FASTPATH_ENABLED:
+        return False
+    prefix = getattr(layer, "prefix", "")
+    if not prefix or prefix.rsplit(".", 1)[-1] != "lm_head":
+        return False
+    if not current_platform.is_cuda_alike():
+        return False
+    if not hasattr(torch.ops._C, "sm70_f16_prepare"):
+        return False
+    if layer.weight.dtype != torch.float16 or not layer.weight.is_cuda:
+        return False
+    if torch.cuda.get_device_capability(layer.weight.device) != (7, 0):
+        return False
+    if layer.weight.ndim != 2:
+        return False
+    if (layer.weight.shape[1] % 16) != 0 or (layer.weight.shape[0] % 32) != 0:
+        return False
+    return True
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
@@ -59,6 +88,16 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=False)
+            return
+
+        if not _is_sm70_lm_head_fastpath_eligible(layer):
+            return
+
+        prepared = ops.sm70_f16_prepare(layer.weight)
+        layer._sm70_f16_tm_weight = prepared[0]
+        layer._sm70_f16_k_ld = int(prepared[1][0].item())
+        layer._sm70_f16_prepared = True
+        logger.info_once("SM70 dense fp16 fast path enabled for LM head.")
 
     def apply(
         self,
@@ -66,6 +105,9 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        sm70_out = maybe_sm70_projection(layer, x)
+        if sm70_out is not None:
+            return sm70_out[0]
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:

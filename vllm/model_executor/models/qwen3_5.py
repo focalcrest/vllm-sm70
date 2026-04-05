@@ -366,6 +366,8 @@ class Qwen3_5Model(Qwen3NextModel):
                     if is_pp_missing_parameter(name_mapped, self):
                         continue
                     if is_fused_expert:
+                        if name_mapped not in params_dict:
+                            continue
                         # qwen3.5 no need to transpose
                         # loaded_weight = loaded_weight.transpose(-1, -2)
                         if "experts.gate_up_proj" in name:
@@ -403,6 +405,8 @@ class Qwen3_5Model(Qwen3NextModel):
                             name_mapped.endswith(".bias")
                             or name_mapped.endswith("_bias")
                         ) and name_mapped not in params_dict:
+                            continue
+                        if name_mapped not in params_dict:
                             continue
                         param = params_dict[name_mapped]
                         weight_loader = param.weight_loader

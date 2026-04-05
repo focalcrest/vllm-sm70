@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import itertools
 from abc import abstractmethod
 
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
 
+from vllm import _custom_ops as ops
 import vllm.envs as envs
 from vllm.distributed import (
     divide,
@@ -27,6 +29,7 @@ from vllm.model_executor.layers.quantization.base_config import (
 )
 from vllm.model_executor.layers.utils import (
     dispatch_unquantized_gemm,
+    maybe_sm70_projection,
 )
 from vllm.model_executor.parameter import (
     BasevLLMParameter,
@@ -41,6 +44,13 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+SM70_F16_DENSE_ENABLED = (
+    os.getenv("VLLM_SM70_ENABLE_DENSE_F16_FASTPATH", "0") == "1"
+)
+SM70_F16_DENSE_MAX_M = int(os.getenv("VLLM_SM70_F16_DENSE_MAX_M", "64"))
+SM70_F16_DENSE_DEBUG = os.getenv("VLLM_SM70_F16_DENSE_DEBUG", "0") == "1"
+SM70_UNQUANT_DEBUG = os.getenv("VLLM_SM70_UNQUANT_DEBUG", "0") == "1"
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "UnquantizedLinearMethod",
@@ -138,6 +148,27 @@ def adjust_scalar_to_fused_array(
     return param_data[shard_id], loaded_weight
 
 
+def _is_sm70_dense_fastpath_eligible(layer: torch.nn.Module) -> bool:
+    if not SM70_F16_DENSE_ENABLED:
+        return False
+    prefix = getattr(layer, "prefix", "")
+    if not prefix:
+        return False
+    if not current_platform.is_cuda_alike():
+        return False
+    if not hasattr(torch.ops._C, "sm70_f16_prepare"):
+        return False
+    if layer.weight.dtype != torch.float16 or not layer.weight.is_cuda:
+        return False
+    if torch.cuda.get_device_capability(layer.weight.device) != (7, 0):
+        return False
+    if layer.weight.ndim != 2:
+        return False
+    if (layer.weight.shape[1] % 16) != 0 or (layer.weight.shape[0] % 32) != 0:
+        return False
+    return True
+
+
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
 
@@ -216,6 +247,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
             from vllm.model_executor.layers.utils import dispatch_cpu_unquantized_gemm
 
             dispatch_cpu_unquantized_gemm(layer, remove_weight=True)
+            return
+
+        if not _is_sm70_dense_fastpath_eligible(layer):
+            return
+
+        prepared = ops.sm70_f16_prepare(layer.weight)
+        layer._sm70_f16_tm_weight = prepared[0]
+        layer._sm70_f16_k_ld = int(prepared[1][0].item())
+        layer._sm70_f16_prepared = True
+        logger.info_once("SM70 dense fp16 fast path enabled.")
 
     def apply(
         self,
@@ -223,6 +264,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        sm70_out = maybe_sm70_projection(layer, x)
+        if sm70_out is not None:
+            return sm70_out[0] if bias is None else sm70_out[0]
         if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
             return linear_batch_invariant(x, layer.weight, bias)
         return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
