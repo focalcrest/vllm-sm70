@@ -579,10 +579,15 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         expert_offsets64 = buffers["expert_offsets64"]
         inv_permuted_idx = buffers["inv_permuted_idx"]
         permuted_idx = buffers["permuted_idx"]
-        topk_ids_i32 = buffers["topk_ids_i32"]
         token_expert_indices = buffers["token_expert_indices"]
 
-        topk_ids_i32.copy_(topk_ids, non_blocking=True)
+        if topk_ids.dtype == torch.int32 and topk_ids.is_contiguous():
+            topk_ids_i32 = topk_ids
+        else:
+            # The router already emits int32 in the normal AWQ path, so this
+            # buffer is only used as a compatibility fallback.
+            topk_ids_i32 = buffers["topk_ids_i32"]
+            topk_ids_i32.copy_(topk_ids, non_blocking=True)
         torch.ops._moe_C.moe_permute(
             x,
             topk_ids_i32,
