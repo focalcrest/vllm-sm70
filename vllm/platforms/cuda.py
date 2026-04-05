@@ -97,6 +97,12 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
     else:
+        if device_capability == DeviceCapability(7, 0):
+            return [
+                AttentionBackendEnum.FLASH_ATTN_SM70,
+                AttentionBackendEnum.TRITON_ATTN,
+                AttentionBackendEnum.FLEX_ATTENTION,
+            ]
         if device_capability.major == 10:
             return [
                 AttentionBackendEnum.FLASHINFER,

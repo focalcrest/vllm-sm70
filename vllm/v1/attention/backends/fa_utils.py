@@ -14,13 +14,15 @@ logger = init_logger(__name__)
 # This module-level flag avoids repeated import attempts and ensures
 # consistent behavior (similar to IS_AITER_FOUND in _aiter_ops.py).
 _ROCM_FLASH_ATTN_AVAILABLE = False
+_CUDA_FLASH_ATTN_SM70_FALLBACK = False
 
 if current_platform.is_cuda():
     from vllm._custom_ops import reshape_and_cache_flash
-    from vllm.vllm_flash_attn import (  # type: ignore[attr-defined]
+    from vllm.vllm_flash_attn_sm70 import (  # type: ignore[attr-defined]
         flash_attn_varlen_func,
         get_scheduler_metadata,
     )
+    _CUDA_FLASH_ATTN_SM70_FALLBACK = True
 
 elif current_platform.is_xpu():
     from vllm import _custom_ops as ops
@@ -61,6 +63,9 @@ def get_flash_attn_version(
     if current_platform.is_rocm():
         # ROCm doesn't use vllm_flash_attn; return None to skip fa_version arg
         return None
+    if current_platform.is_cuda() and _CUDA_FLASH_ATTN_SM70_FALLBACK:
+        # The SM70 fallback only provides the FA2-style varlen path.
+        return 2
     try:
         from vllm.vllm_flash_attn.flash_attn_interface import (
             fa_version_unsupported_reason,

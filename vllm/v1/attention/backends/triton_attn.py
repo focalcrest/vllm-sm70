@@ -215,6 +215,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         slot_mapping = common_attn_metadata.slot_mapping
 
         use_cascade = common_prefix_len > 0
+        prefix_scheduler_metadata = None
 
         if use_cascade:
             cu_prefix_query_lens = torch.tensor(
@@ -229,7 +230,6 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
             cu_prefix_query_lens = None
             prefix_kv_lens = None
             suffix_kv_lens = None
-            prefix_scheduler_metadata = None
 
         attn_metadata = TritonAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
