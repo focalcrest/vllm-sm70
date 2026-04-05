@@ -29,7 +29,6 @@ logger = init_logger(__name__)
 # Lazy imports: only resolve optional CUDA extensions when needed.
 _flash_attn_func = None
 _flash_attn_decode_paged = None
-_paged_kv_utils = None
 _warned_prefill_fallback = False
 _warned_feature_fallback = False
 _warned_decode_fallback = False
@@ -59,19 +58,6 @@ def _get_flash_ops():
     return _flash_attn_func, _flash_attn_decode_paged
 
 
-def _get_paged_kv_utils():
-    """Lazy-load paged KV extraction CUDA extension."""
-    global _paged_kv_utils
-    if _paged_kv_utils is None:
-        try:
-            import paged_kv_utils
-
-            _paged_kv_utils = paged_kv_utils
-        except ImportError:
-            _paged_kv_utils = None
-    return _paged_kv_utils
-
-
 def _has_prefix_context(attn_metadata: TritonAttentionMetadata) -> bool:
     query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
     return not torch.equal(query_lens, attn_metadata.seq_lens)
@@ -85,84 +71,6 @@ def _is_cascade_supported(attn_metadata: TritonAttentionMetadata) -> bool:
         and attn_metadata.sinks is None
         and attn_metadata.sliding_window == (-1, -1)
     )
-
-
-def _build_cu_seqlens(lengths: torch.Tensor) -> torch.Tensor:
-    """Build a cu_seqlens tensor from per-sequence lengths."""
-    return torch.cat(
-        (
-            torch.zeros(1, dtype=torch.int32, device=lengths.device),
-            torch.cumsum(lengths.to(torch.int32), dim=0),
-        )
-    )
-
-
-def _extract_contiguous_kv_from_paged_cache(
-    kv_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    num_kv_heads: int,
-    head_dim: int,
-    block_size: int,
-    total_tokens: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    paged_kv_utils = _get_paged_kv_utils()
-
-    if isinstance(kv_cache, (list, tuple)):
-        key_cache, value_cache = kv_cache[0], kv_cache[1]
-    else:
-        if kv_cache.shape[0] == 2:
-            key_cache, value_cache = kv_cache.unbind(0)
-        elif kv_cache.shape[1] == 2:
-            key_cache, value_cache = kv_cache.unbind(1)
-        else:
-            raise ValueError(
-                f"Unexpected KV cache shape {tuple(kv_cache.shape)}; "
-                "expected dimension 2 at axis 0 or 1"
-            )
-
-    if paged_kv_utils is not None:
-        k_cont = paged_kv_utils.paged_to_contiguous(key_cache, block_table, seq_lens)
-        v_cont = paged_kv_utils.paged_to_contiguous(value_cache, block_table, seq_lens)
-        if total_tokens is None:
-            total_tokens = int(seq_lens.sum().item())
-        return k_cont[:total_tokens], v_cont[:total_tokens]
-
-    batch_size = block_table.shape[0]
-    if total_tokens is None:
-        total_tokens = int(seq_lens.sum().item())
-
-    k_cont = torch.empty(
-        (total_tokens, num_kv_heads, head_dim),
-        dtype=key_cache.dtype,
-        device=key_cache.device,
-    )
-    v_cont = torch.empty(
-        (total_tokens, num_kv_heads, head_dim),
-        dtype=value_cache.dtype,
-        device=value_cache.device,
-    )
-
-    token_offset = 0
-    for batch_idx in range(batch_size):
-        seq_len = int(seq_lens[batch_idx].item())
-        if seq_len == 0:
-            continue
-
-        num_blocks = (seq_len + block_size - 1) // block_size
-        for block_idx in range(num_blocks):
-            physical_block_idx = int(block_table[batch_idx, block_idx].item())
-            start_token = block_idx * block_size
-            end_token = min(start_token + block_size, seq_len)
-            n = end_token - start_token
-
-            k_cont[token_offset : token_offset + n] = key_cache[physical_block_idx, :n]
-            v_cont[token_offset : token_offset + n] = value_cache[
-                physical_block_idx, :n
-            ]
-            token_offset += n
-
-    return k_cont, v_cont
 
 
 class FlashAttnSM70MetadataBuilder(TritonAttentionMetadataBuilder):
@@ -331,25 +239,14 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         else:
             key_cache, value_cache = kv_cache.unbind(1)
 
-        block_size = key_cache.shape[-3]
-        total_tokens = int(attn_metadata.seq_lens.sum().item())
-        key_contig, value_contig = _extract_contiguous_kv_from_paged_cache(
-            kv_cache,
-            attn_metadata.block_table,
-            attn_metadata.seq_lens,
-            num_kv_heads=key_cache.shape[-2],
-            head_dim=key_cache.shape[-1],
-            block_size=block_size,
-            total_tokens=total_tokens,
-        )
-
         self.flash_attn_func(
             q=query,
-            k=key_contig,
-            v=value_contig,
+            k=key_cache,
+            v=value_cache,
             out=out_view,
             cu_seqlens_q=attn_metadata.query_start_loc,
-            cu_seqlens_k=_build_cu_seqlens(attn_metadata.seq_lens),
+            seqused_k=attn_metadata.seq_lens,
+            block_table=attn_metadata.block_table,
             max_seqlen_q=attn_metadata.max_query_len,
             max_seqlen_k=attn_metadata.max_seq_len,
             softmax_scale=self.scale,
@@ -439,13 +336,13 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
                     layer,
                     query,
                     key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                output_scale,
-                output_block_scale,
-            )
+                    value,
+                    kv_cache,
+                    attn_metadata,
+                    output,
+                    output_scale,
+                    output_block_scale,
+                )
             if attn_metadata.common_prefix_len > 0 and _is_cascade_supported(
                 attn_metadata
             ):
