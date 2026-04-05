@@ -394,7 +394,7 @@ Sm70F16WeightCacheEntry prepare_sm70_f16_weight(torch::Tensor weight,
   const int64_t n = weight.size(0);
   const int64_t k = weight.size(1);
 
-  const auto converters = turbomind::gemm::GetConverters(
+  static const auto converters = turbomind::gemm::GetConverters(
       turbomind::kHalf, turbomind::kHalf, turbomind::kHalf, true, 70);
   const auto* conv_w = converters[0];
   TORCH_CHECK(conv_w, "sm70_f16_prepare: no compatible TurboMind converter.");
@@ -582,8 +582,13 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor qweight,
               group_size, ".");
 
   const bool grouped = (group_size != k);
-  const auto converters = turbomind::gemm::GetConverters(
-      turbomind::kHalf, turbomind::kUint4, turbomind::kHalf, grouped, 70);
+  static const auto grouped_converters =
+      turbomind::gemm::GetConverters(
+          turbomind::kHalf, turbomind::kUint4, turbomind::kHalf, true, 70);
+  static const auto ungrouped_converters =
+      turbomind::gemm::GetConverters(
+          turbomind::kHalf, turbomind::kUint4, turbomind::kHalf, false, 70);
+  const auto& converters = grouped ? grouped_converters : ungrouped_converters;
   const auto* conv_w = converters[0];
   const auto* conv_s = converters[1];
   TORCH_CHECK(conv_w && conv_s,
@@ -788,8 +793,13 @@ void awq_gemm_sm70_out(torch::Tensor out,
   }
 
   const bool grouped = (group_size != k);
-  const auto converters = turbomind::gemm::GetConverters(
-      turbomind::kHalf, turbomind::kUint4, turbomind::kHalf, grouped, 70);
+  static const auto grouped_converters =
+      turbomind::gemm::GetConverters(
+          turbomind::kHalf, turbomind::kUint4, turbomind::kHalf, true, 70);
+  static const auto ungrouped_converters =
+      turbomind::gemm::GetConverters(
+          turbomind::kHalf, turbomind::kUint4, turbomind::kHalf, false, 70);
+  const auto& converters = grouped ? grouped_converters : ungrouped_converters;
   const auto* conv_w = converters[0];
   const auto* conv_s = converters[1];
   TORCH_CHECK(conv_w && conv_s,
@@ -937,7 +947,7 @@ void sm70_f16_gemm_out(torch::Tensor out,
       static_cast<int>(k),
       static_cast<int>(in_feats.stride(0)),
   };
-  const auto converters = turbomind::gemm::GetConverters(
+  static const auto converters = turbomind::gemm::GetConverters(
       turbomind::kHalf, turbomind::kHalf, turbomind::kHalf, true, 70);
   const auto* conv_w = converters[0];
   TORCH_CHECK(conv_w, "sm70_f16_gemm: no compatible TurboMind converter.");
@@ -1783,8 +1793,13 @@ void awq_moe_gemm_sm70_out(
   if (total_tokens == 0) return;
 
   const bool grouped = (group_size != k);
-  const auto converters = turbomind::gemm::GetConverters(
-      turbomind::kHalf, turbomind::kUint4, turbomind::kHalf, grouped, 70);
+  static const auto grouped_converters =
+      turbomind::gemm::GetConverters(
+          turbomind::kHalf, turbomind::kUint4, turbomind::kHalf, true, 70);
+  static const auto ungrouped_converters =
+      turbomind::gemm::GetConverters(
+          turbomind::kHalf, turbomind::kUint4, turbomind::kHalf, false, 70);
+  const auto& converters = grouped ? grouped_converters : ungrouped_converters;
   const auto* conv_w = converters[0];
   const auto* conv_s = converters[1];
   TORCH_CHECK(conv_w && conv_s,
