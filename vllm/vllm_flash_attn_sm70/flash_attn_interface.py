@@ -1,5 +1,6 @@
 # Copyright (c) 2023, Tri Dao.
 
+import os
 from typing import Optional, Union, Tuple, List
 
 import torch
@@ -41,6 +42,18 @@ def fa_version_unsupported_reason(fa_version: int, device = None) \
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
+
+def _decode_num_splits() -> int:
+    raw = os.environ.get("SM70_FLASH_ATTN_DECODE_NUM_SPLITS")
+    if raw is None:
+        raw = os.environ.get("VLLM_SM70_FLASH_ATTN_DECODE_NUM_SPLITS")
+    if raw is None:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
 
 # NOTE only used in FA3
 def get_scheduler_metadata(
@@ -260,3 +273,87 @@ def flash_attn_varlen_func(
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")
     return (out, softmax_lse) if return_softmax_lse else out
+
+
+def flash_attn_decode_paged(
+    q,
+    k_cache,
+    v_cache,
+    block_table,
+    seq_lens,
+    *,
+    out=None,
+    softmax_scale=None,
+    causal=True,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+    rotary_interleaved=True,
+    num_splits=0,
+):
+    """Paged decode wrapper for SM70 FlashAttention.
+
+    This is a direct wrapper over the native _vllm_fa2_sm70_C.fwd_kvcache op.
+    It expects the current vLLM paged KV cache layout and block table directly,
+    without materializing a contiguous intermediate buffer.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    q = maybe_contiguous(q)
+    k_cache = maybe_contiguous(k_cache)
+    v_cache = maybe_contiguous(v_cache)
+    block_table = maybe_contiguous(block_table)
+    seq_lens = maybe_contiguous(seq_lens)
+    alibi_slopes = maybe_contiguous(alibi_slopes)
+
+    if q.dim() == 3:
+        q = q.unsqueeze(1)
+
+    if q.dim() != 4 or q.shape[1] != 1:
+        raise ValueError(
+            "flash_attn_decode_paged expects q shaped [batch, 1, num_heads, head_dim] "
+            f"(or [batch, num_heads, head_dim]); got {tuple(q.shape)}"
+        )
+
+    if out is not None:
+        out = maybe_contiguous(out)
+        if out.dim() == 2:
+            out = out.view(q.shape[0], q.shape[1], q.shape[2], q.shape[3])
+        elif out.dim() == 3:
+            out = out.unsqueeze(1)
+        if out.dim() != 4:
+            raise ValueError(
+                "flash_attn_decode_paged expects out shaped [batch, hidden], "
+                "[batch, num_heads, head_dim], or [batch, 1, num_heads, head_dim]; "
+                f"got {tuple(out.shape)}"
+            )
+
+    out_tensors = torch.ops._vllm_fa2_sm70_C.fwd_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        None,
+        None,
+        seq_lens,
+        None,
+        None,
+        None,
+        None,
+        block_table,
+        alibi_slopes,
+        out,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        rotary_interleaved,
+        _decode_num_splits() if num_splits <= 0 else num_splits,
+    )
+
+    # The custom op mutates `out` in-place when provided. Keep the return value
+    # simple for the backend call-site.
+    if out is not None:
+        return out
+    return out_tensors[0]

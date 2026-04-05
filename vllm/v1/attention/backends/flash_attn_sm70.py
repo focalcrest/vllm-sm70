@@ -33,6 +33,7 @@ _paged_kv_utils = None
 _warned_prefill_fallback = False
 _warned_feature_fallback = False
 _warned_decode_fallback = False
+_warned_decode_runtime_fallback = False
 _warned_missing_flash_ops = False
 _warned_gqa_fallback = False
 _warned_prefill_runtime_fallback = False
@@ -522,7 +523,28 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         if not _logged_decode_flash:
             logger.info("FLASH_ATTN_SM70 decode path active.")
             _logged_decode_flash = True
-        return self._flash_v100_decode(query, key, value, kv_cache, attn_metadata, output)
+        try:
+            return self._flash_v100_decode(
+                query, key, value, kv_cache, attn_metadata, output
+            )
+        except (RuntimeError, ValueError, IndexError):
+            self.use_flash_v100_decode = False
+            if self.use_flash_v100 and not _warned_decode_runtime_fallback:
+                logger.warning(
+                    "FLASH_ATTN_SM70 decode op failed at runtime; disabling the decode hook and falling back to Triton."
+                )
+                _warned_decode_runtime_fallback = True
+            return super().forward(
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+                output_scale,
+                output_block_scale,
+            )
 
     def _flash_v100_prefill(
         self,

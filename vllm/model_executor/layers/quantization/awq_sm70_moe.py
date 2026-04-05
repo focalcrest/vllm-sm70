@@ -32,6 +32,8 @@ _DEFAULT_PERSISTENT_MAX_TOKENS = 32
 
 def _single_token_compact_enabled() -> bool:
     raw = os.getenv("VLLM_SM70_AWQ_ENABLE_SINGLE_TOKEN_COMPACT")
+    if raw is None:
+        return True
     return raw == "1"
 
 
@@ -468,6 +470,7 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                                       device=device),
         }
 
+    @torch.compiler.disable
     def apply(
         self,
         layer: torch.nn.Module,
@@ -477,6 +480,11 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """MoE forward: batched GEMM (preferred) or sorted-loop fallback."""
+        # Keep MoE dispatch/permute outside torch.compile so graph capture can
+        # still focus on the attention/decode path on SM70.
+        #
+        # The native SM70 kernels remain hot-path candidates here, but we do not
+        # want compile to trace through the Python-side expert routing logic.
         del shared_experts_input
         if (
             getattr(layer, "sm70_batched_ready", False)

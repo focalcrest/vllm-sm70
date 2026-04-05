@@ -6,13 +6,12 @@ paged decode hook optional so the backend can fall back to Triton cleanly.
 """
 
 from vllm.vllm_flash_attn_sm70.flash_attn_interface import (
+    flash_attn_decode_paged,
     flash_attn_varlen_func,
 )
 
-# The current SM70 port only provides the dense varlen path.
-# Decode can remain on Triton until a paged KV implementation is added.
+# Expose both the dense varlen path and the paged-decode wrapper.
 flash_attn_func = flash_attn_varlen_func
-flash_attn_decode_paged = None
 
 __all__ = [
     "flash_attn_varlen_func",
