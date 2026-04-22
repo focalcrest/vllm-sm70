@@ -40,6 +40,7 @@ from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
 from vllm.model_executor.layers.fused_moe.sm70_decode_fastpath import (
+    maybe_prepare_sm70_decode_fastpath,
     maybe_apply_sm70_decode_fastpath,
 )
 
@@ -292,6 +293,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 w13=layer.w13_weight,
                 w2=layer.w2_weight,
             )
+            maybe_prepare_sm70_decode_fastpath(layer)
 
     def apply(
         self,

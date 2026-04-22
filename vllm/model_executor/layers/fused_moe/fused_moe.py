@@ -26,7 +26,9 @@ from vllm.model_executor.layers.fused_moe.config import (
     _get_config_dtype_str,
 )
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
+    get_moe_align_block_size_output_sizes,
     moe_align_block_size,
+    moe_align_block_size_into,
 )
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
@@ -50,8 +52,29 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.worker.workspace import (
+    current_workspace_manager,
+    is_workspace_manager_initialized,
+)
 
 logger = init_logger(__name__)
+
+
+def _should_use_workspace_backed_moe_routing(
+    hidden_states: torch.Tensor, topk_ids: torch.Tensor
+) -> bool:
+    return (
+        os.getenv("VLLM_SM70_ENABLE_WORKSPACE_ROUTING") == "1"
+        and
+        is_workspace_manager_initialized()
+        and current_platform.is_cuda()
+        and current_platform.is_device_capability((7, 0))
+        and hidden_states.dtype == torch.float16
+        and hidden_states.device.type == "cuda"
+        and hidden_states.ndim == 2
+        and hidden_states.shape[0] <= 8
+        and topk_ids.device == hidden_states.device
+    )
 
 
 @triton.jit
@@ -2066,9 +2089,38 @@ class TritonExperts(mk.FusedMoEExpertsModular):
         )
         intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
-        )
+        if _should_use_workspace_backed_moe_routing(hidden_states, topk_ids):
+            max_num_tokens_padded, max_num_m_blocks = (
+                get_moe_align_block_size_output_sizes(
+                    topk_ids,
+                    config["BLOCK_SIZE_M"],
+                    global_num_experts,
+                )
+            )
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                current_workspace_manager().get_simultaneous(
+                    ((max_num_tokens_padded,), torch.int32),
+                    ((max_num_m_blocks,), torch.int32),
+                    ((1,), torch.int32),
+                )
+            )
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                moe_align_block_size_into(
+                    topk_ids,
+                    config["BLOCK_SIZE_M"],
+                    global_num_experts,
+                    sorted_ids=sorted_token_ids,
+                    expert_ids=expert_ids,
+                    num_tokens_post_pad=num_tokens_post_padded,
+                    expert_map=expert_map,
+                )
+            )
+        else:
+            sorted_token_ids, expert_ids, num_tokens_post_padded = (
+                moe_align_block_size(
+                    topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
+                )
+            )
 
         invoke_fused_moe_triton_kernel(
             hidden_states,
