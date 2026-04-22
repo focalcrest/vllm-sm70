@@ -28,6 +28,10 @@ from vllm.model_executor.layers.fused_moe.config import (
 from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
     moe_align_block_size,
 )
+from vllm.model_executor.layers.fused_moe.sm70_decode_fastpath import (
+    build_sm70_compact_routing,
+    should_use_sm70_compact_routing,
+)
 from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceNoOP,
 )
@@ -2066,9 +2070,24 @@ class TritonExperts(mk.FusedMoEExpertsModular):
         )
         intermediate_cache3 = _resize_cache(workspace2, (num_tokens, top_k_num, K))
 
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
+        compact_routing_decision = should_use_sm70_compact_routing(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            expert_map=expert_map,
         )
+        if compact_routing_decision.eligible:
+            compact_routing = build_sm70_compact_routing(
+                topk_ids=topk_ids,
+                block_size=config["BLOCK_SIZE_M"],
+                num_experts=global_num_experts,
+            )
+            sorted_token_ids = compact_routing.sorted_token_ids
+            expert_ids = compact_routing.expert_ids
+            num_tokens_post_padded = compact_routing.num_tokens_post_padded
+        else:
+            sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
+                topk_ids, config["BLOCK_SIZE_M"], global_num_experts, expert_map
+            )
 
         invoke_fused_moe_triton_kernel(
             hidden_states,

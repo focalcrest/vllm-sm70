@@ -39,6 +39,9 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.platforms.interface import CpuArchEnum
+from vllm.model_executor.layers.fused_moe.sm70_decode_fastpath import (
+    maybe_apply_sm70_decode_fastpath,
+)
 
 if current_platform.is_cuda_alike() or current_platform.is_xpu():
     from .fused_batched_moe import BatchedTritonExperts
@@ -324,6 +327,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self.kernel is not None
+
+        fastpath_out = maybe_apply_sm70_decode_fastpath(
+            layer=layer,
+            x=x,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            shared_experts_input=shared_experts_input,
+        )
+        if fastpath_out is not None:
+            return fastpath_out
 
         return self.kernel.apply(
             hidden_states=x,
