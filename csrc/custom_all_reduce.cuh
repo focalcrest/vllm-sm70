@@ -449,9 +449,19 @@ class CustomAllreduce {
       void* base_ptr;
       // note: must share the base address of each allocation, or we get wrong
       // address
-      if (cuPointerGetAttribute(&base_ptr, rangeStartAddrAttr,
-                                (CUdeviceptr)ptr) != CUDA_SUCCESS)
-        throw std::runtime_error("failed to get pointer attr");
+      CUresult attr_result = cuPointerGetAttribute(&base_ptr, rangeStartAddrAttr,
+                                (CUdeviceptr)ptr);
+      if (attr_result != CUDA_SUCCESS) {
+        // SM70 (V100): cuPointerGetAttribute can fail for CUDA graph pool
+        // allocations. Fall back to cuMemGetAddressRange.
+        CUdeviceptr base = 0;
+        size_t base_size = 0;
+        if (cuMemGetAddressRange(&base, &base_size, (CUdeviceptr)ptr)
+            != CUDA_SUCCESS)
+          throw std::runtime_error(
+              "failed to get pointer base address (both methods failed)");
+        base_ptr = reinterpret_cast<void*>(base);
+      }
       CUDACHECK(cudaIpcGetMemHandle(
           (cudaIpcMemHandle_t*)&handles[i * handle_sz], base_ptr));
       offsets[i] = ((char*)ptr) - ((char*)base_ptr);
