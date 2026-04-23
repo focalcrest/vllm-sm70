@@ -12,6 +12,24 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 
+def _get_sm70_causal_conv1d_update_launch_params(
+    x: torch.Tensor,
+    width: int,
+    seqlen: int,
+) -> tuple[int, int, int] | None:
+    if x.device.type != "cuda":
+        return None
+    major, minor = torch.cuda.get_device_capability(x.device)
+    if (major, minor) != (7, 0):
+        return None
+    # Qwen3.6-27B TP4 decode on V100: width=4, seqlen=1, dim=5120.
+    # Real-function A/B shows only a small headroom here; BLOCK_N=128 with
+    # 1 warp and 1 stage is the best point among the tested candidates.
+    if width == 4 and seqlen == 1:
+        return (128, 1, 1)
+    return None
+
+
 @triton.jit()
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -1193,6 +1211,14 @@ def causal_conv1d_update(
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
+    sm70_tuned = _get_sm70_causal_conv1d_update_launch_params(x, width, seqlen)
+    if sm70_tuned is None:
+        block_n = 256
+        num_warps = 4
+        num_stages = 2
+    else:
+        block_n, num_warps, num_stages = sm70_tuned
+
     _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
         x,
@@ -1235,7 +1261,9 @@ def causal_conv1d_update(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=block_n,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     if unsqueeze:
         out = out.squeeze(-1)

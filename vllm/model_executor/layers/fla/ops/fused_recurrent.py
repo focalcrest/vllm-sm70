@@ -15,6 +15,24 @@ from vllm.triton_utils import tl, triton
 from .op import exp
 
 
+def _get_sm70_packed_decode_launch_params(
+    device: torch.device,
+    k: int,
+    v: int,
+) -> tuple[int, int, int] | None:
+    if device.type != "cuda":
+        return None
+    major, minor = torch.cuda.get_device_capability(device)
+    if (major, minor) != (7, 0):
+        return None
+    # Qwen3.6-27B TP4 decode shape on V100: K=128, V=128. This kernel is one of
+    # the dominant decode hotspots; on SM70 these launch params outperform the
+    # generic defaults materially for this exact shape.
+    if k == 128 and v == 128:
+        return (64, 8, 1)
+    return None
+
+
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
@@ -335,6 +353,8 @@ def fused_recurrent_gated_delta_rule_packed_decode_kernel(
     tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
 
 
+
+
 def fused_recurrent_gated_delta_rule_packed_decode(
     mixed_qkv: torch.Tensor,
     a: torch.Tensor,
@@ -433,9 +453,13 @@ def fused_recurrent_gated_delta_rule_packed_decode(
         raise ValueError(
             f"Packed decode kernel only supports NK=1 (got K={K}, BK={BK})."
         )
-    BV = min(triton.next_power_of_2(V), 32)
-    num_stages = 3
-    num_warps = 1
+    sm70_tuned = _get_sm70_packed_decode_launch_params(dev, K, V)
+    if sm70_tuned is None:
+        BV = min(triton.next_power_of_2(V), 32)
+        num_stages = 3
+        num_warps = 1
+    else:
+        BV, num_warps, num_stages = sm70_tuned
 
     stride_mixed_qkv_tok = mixed_qkv.stride(0)
     stride_a_tok = a.stride(0)
