@@ -187,3 +187,37 @@ fptr_t open_mem_handle(torch::Tensor& mem_handle) {
 void free_shared_buffer(fptr_t buffer) {
   AT_CUDA_CHECK(cudaFree(reinterpret_cast<void*>(buffer)));
 }
+
+fptr_t init_custom_ar_hierarchical(
+    const std::vector<fptr_t>& fake_ipc_ptrs,
+    torch::Tensor& rank_data, int64_t rank,
+    int64_t group_id, int64_t local_rank, int64_t partner_rank) {
+  int world_size = fake_ipc_ptrs.size();
+  if (world_size > 8)
+    throw std::invalid_argument("world size > 8 is not supported");
+  if (world_size % 2 != 0)
+    throw std::invalid_argument("Odd num gpus is not supported for now");
+  if (rank < 0 || rank >= world_size)
+    throw std::invalid_argument("invalid rank passed in");
+
+  vllm::Signal* ipc_ptrs[8];
+  for (int i = 0; i < world_size; i++) {
+    ipc_ptrs[i] = reinterpret_cast<vllm::Signal*>(fake_ipc_ptrs[i]);
+  }
+  // fully_connected=false: don't use 1-stage/2-stage full-mesh kernels
+  auto* fa = new vllm::CustomAllreduce(ipc_ptrs, rank_data.data_ptr(),
+                                       rank_data.numel(), rank, world_size,
+                                       false);
+  fa->init_hierarchical(group_id, local_rank, partner_rank);
+  return (fptr_t)fa;
+}
+
+void register_group_buffer(fptr_t _fa,
+                           const std::vector<fptr_t>& fake_ipc_ptrs) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  void* ipc_ptrs[8];
+  for (int i = 0; i < fake_ipc_ptrs.size(); i++) {
+    ipc_ptrs[i] = reinterpret_cast<void*>(fake_ipc_ptrs[i]);
+  }
+  fa->register_group_buffer(ipc_ptrs);
+}
