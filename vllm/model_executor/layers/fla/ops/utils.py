@@ -29,6 +29,9 @@ FLA_GDN_CHUNK_SIZE = int(os.getenv("FLA_GDN_CHUNK_SIZE", "32"))
 
 SUPPRESS_LEVEL = int(os.getenv("GDN_RECOMPUTE_SUPPRESS_LEVEL", "0"))
 
+# Default chunk size used across FLA triton kernels (kda, chunk, chunk_o, etc.)
+FLA_CHUNK_SIZE = 64
+
 
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
     """
@@ -153,9 +156,13 @@ is_nvidia_hopper = is_nvidia and (
 )
 use_cuda_graph = is_nvidia and os.environ.get("FLA_USE_CUDA_GRAPH", "0") == "1"
 is_gather_supported = hasattr(triton.language, "gather")
-is_tma_supported = (is_nvidia and torch.cuda.get_device_capability(0)[0] >= 9) and (
-    hasattr(triton.language, "_experimental_make_tensor_descriptor")
-    or hasattr(triton.language, "make_tensor_descriptor")
+is_tma_supported = (
+    is_nvidia_hopper
+    and os.getenv("FLA_USE_TMA", "0") == "1"
+    and (
+        hasattr(triton.language, "_experimental_make_tensor_descriptor")
+        or hasattr(triton.language, "make_tensor_descriptor")
+    )
 )
 
 
