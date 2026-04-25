@@ -143,8 +143,11 @@ def bundle_tcmalloc(build_lib: str) -> None:
 
 
 class CMakeExtension(Extension):
-    def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
-        super().__init__(name, sources=[], py_limited_api=not is_freethreaded(), **kwa)
+    def __init__(self, name: str, cmake_lists_dir: str = ".",
+                 py_limited_api: bool | None = None, **kwa) -> None:
+        if py_limited_api is None:
+            py_limited_api = not is_freethreaded()
+        super().__init__(name, sources=[], py_limited_api=py_limited_api, **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 

@@ -5,6 +5,8 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from vllm.logger import init_logger
+
 import torch
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -33,6 +35,8 @@ from vllm.model_executor.layers.utils import (
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
+
+logger = init_logger(__name__)
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
 SM70_LM_HEAD_FASTPATH_ENABLED = (
@@ -101,6 +105,7 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         layer._sm70_f16_tm_weight = prepared[0]
         layer._sm70_f16_k_ld = int(prepared[1][0].item())
         layer._sm70_f16_prepared = True
+        layer.weight.data = torch.empty(0, dtype=layer.weight.dtype)
         logger.info_once("SM70 dense fp16 fast path enabled for LM head.")
 
     def apply(
@@ -283,6 +288,7 @@ class VocabParallelEmbedding(PluggableLayer):
         prefix: str = "",
     ):
         super().__init__()
+        self.prefix = prefix
 
         # Keep the input dimensions.
         tp_rank = get_tensor_model_parallel_rank()
