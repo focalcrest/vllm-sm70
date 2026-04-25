@@ -398,8 +398,8 @@ cross_device_reduce_hierarchical(
       st_flag_release(&group_sg.signals[threadIdx.x]->end[b1][local_rank], f1);
       while (ld_flag_acquire(&self_sg->end[b1][threadIdx.x]) != f1);
       if (threadIdx.x < 2) {
-        st_flag_volatile(&cross_sg.signals[threadIdx.x]->start[p2b][cross_rank], p2f);
-        while (ld_flag_volatile(&self_sg->start[p2b][threadIdx.x]) != p2f);
+        st_flag_release(&cross_sg.signals[threadIdx.x]->start[p2b][cross_rank], p2f);
+        while (ld_flag_acquire(&self_sg->start[p2b][threadIdx.x]) != p2f);
       }
     }
     __syncthreads();
@@ -419,8 +419,8 @@ cross_device_reduce_hierarchical(
     __syncthreads();
     uint32_t p2f = self_sg->_flag[p2b] + 1;
     if (threadIdx.x < 2) {
-      st_flag_volatile(&cross_sg.signals[threadIdx.x]->end[p2b][cross_rank], p2f);
-      while (ld_flag_volatile(&self_sg->end[p2b][threadIdx.x]) != p2f);
+      st_flag_release(&cross_sg.signals[threadIdx.x]->end[p2b][cross_rank], p2f);
+      while (ld_flag_acquire(&self_sg->end[p2b][threadIdx.x]) != p2f);
     }
     if (threadIdx.x == 0) self_sg->_flag[p2b] = p2f;
   }
