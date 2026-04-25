@@ -255,16 +255,27 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int group_size, bool interleave_gated_silu) -> Tensor[]");
   ops.impl("awq_sm70_prepare", torch::kCUDA, &awq_sm70_prepare);
 
+  ops.def("sm70_f16_prepare(Tensor _kernel) -> Tensor[]");
+  ops.impl("sm70_f16_prepare", torch::kCUDA, &sm70_f16_prepare);
+
   ops.def(
       "awq_gemm_sm70(Tensor _in_feats, Tensor _kernel, Tensor "
       "_scaling_factors, int group_size, int k_ld, int q_ld) -> Tensor");
   ops.impl("awq_gemm_sm70", torch::kCUDA, &awq_gemm_sm70);
+
+  ops.def("sm70_f16_gemm(Tensor _in_feats, Tensor _kernel) -> Tensor");
+  ops.impl("sm70_f16_gemm", torch::kCUDA, &sm70_f16_gemm);
 
   ops.def(
       "awq_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
       "Tensor _scaling_factors, int group_size, int k_ld, int q_ld, "
       "bool gated_silu) -> ()");
   ops.impl("awq_gemm_sm70_out", torch::kCUDA, &awq_gemm_sm70_out);
+
+  ops.def(
+      "sm70_f16_gemm_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
+      "int k_ld, bool gated_silu) -> ()");
+  ops.impl("sm70_f16_gemm_out", torch::kCUDA, &sm70_f16_gemm_out);
 
   ops.def("sm70_gemm_import_cache(Tensor device_hint, str path) -> int");
   ops.impl("sm70_gemm_import_cache", torch::kCUDA, &sm70_gemm_import_cache);

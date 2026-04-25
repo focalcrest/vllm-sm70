@@ -202,14 +202,22 @@ std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor _kernel,
                                             int64_t group_size,
                                             bool interleave_gated_silu);
 
+std::vector<torch::Tensor> sm70_f16_prepare(torch::Tensor _kernel);
+
 torch::Tensor awq_gemm_sm70(torch::Tensor _in_feats,
                             torch::Tensor _kernel,
                             torch::Tensor _scaling_factors, int64_t group_size,
                             int64_t k_ld, int64_t q_ld);
 
+torch::Tensor sm70_f16_gemm(torch::Tensor _in_feats, torch::Tensor _kernel);
+
 void awq_gemm_sm70_out(torch::Tensor out, torch::Tensor _in_feats,
                        torch::Tensor _kernel, torch::Tensor _scaling_factors,
                        int64_t group_size, int64_t k_ld, int64_t q_ld,
+                       bool gated_silu);
+
+void sm70_f16_gemm_out(torch::Tensor out, torch::Tensor _in_feats,
+                       torch::Tensor _kernel, int64_t k_ld,
                        bool gated_silu);
 
 std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
