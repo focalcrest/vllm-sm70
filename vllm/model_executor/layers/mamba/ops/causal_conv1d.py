@@ -1259,7 +1259,6 @@ def causal_conv1d_update(
         IS_APC_ENABLED=block_idx_last_scheduled_token is not None,
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
-        USE_PAD_SLOT=pad_slot_id is not None,
         HAS_NULL_BLOCK=null_block_id is not None,
         BLOCK_N=block_n,
         num_warps=num_warps,

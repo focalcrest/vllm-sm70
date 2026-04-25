@@ -63,6 +63,19 @@ def _decode_num_splits() -> int:
     except ValueError:
         return 0
 
+
+def _prefill_num_splits(max_seqlen_k: int, num_heads: int) -> int:
+    """Override num_splits for prefill to improve SM utilization on V100.
+
+    With few heads (e.g. 3 at TP8), the default split-KV path runs with
+    Split=false, leaving most SMs idle. Setting num_splits > 1 enables
+    true KV splitting for better parallelism at long sequences.
+    """
+    raw = os.environ.get("VLLM_SM70_FLASH_ATTN_PREFILL_NUM_SPLITS")
+    if raw is not None:
+        return max(0, int(raw))
+    return 0
+
 # NOTE only used in FA3
 def get_scheduler_metadata(
     batch_size, max_seqlen_q, max_seqlen_k, num_heads_q, num_heads_kv, headdim,
@@ -221,8 +234,9 @@ def flash_attn_varlen_func(
                 )
         if s_aux is not None:
             raise NotImplementedError("FA2 does not support s_aux")
-        if num_splits > 1:
-            raise NotImplementedError("FA2 does not support num_splits > 1")
+        # Allow split-KV for prefill when env var is set
+        if num_splits <= 1 and max_seqlen_q > 1:
+            num_splits = _prefill_num_splits(max_seqlen_k, q.shape[1])
         out, softmax_lse = torch.ops._vllm_fa2_sm70_C.varlen_fwd(
             q, k, v,
             out,
