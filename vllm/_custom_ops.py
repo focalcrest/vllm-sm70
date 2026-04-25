@@ -3125,6 +3125,23 @@ def register_buffer(fa: int, ipc_tensors: list[int]) -> None:
     return torch.ops._C_custom_ar.register_buffer(fa, ipc_tensors)
 
 
+def init_custom_ar_hierarchical(
+    ipc_tensors: list[torch.Tensor],
+    rank_data: torch.Tensor,
+    rank: int,
+    group_id: int,
+    local_rank: int,
+    partner_rank: int,
+) -> int:
+    return torch.ops._C_custom_ar.init_custom_ar_hierarchical(
+        ipc_tensors, rank_data, rank, group_id, local_rank, partner_rank
+    )
+
+
+def register_group_buffer(fa: int, ipc_tensors: list[int]) -> None:
+    return torch.ops._C_custom_ar.register_group_buffer(fa, ipc_tensors)
+
+
 def get_graph_buffer_ipc_meta(fa: int) -> tuple[list[int], list[int]]:
     return torch.ops._C_custom_ar.get_graph_buffer_ipc_meta(fa)
 

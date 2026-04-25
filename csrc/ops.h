@@ -441,6 +441,12 @@ std::tuple<int64_t, torch::Tensor> allocate_shared_buffer_and_handle(
     int64_t size);
 int64_t open_mem_handle(torch::Tensor& mem_handle);
 void free_shared_buffer(int64_t buffer);
+fptr_t init_custom_ar_hierarchical(const std::vector<int64_t>& fake_ipc_ptrs,
+                                    torch::Tensor& rank_data, int64_t rank,
+                                    int64_t group_id, int64_t local_rank,
+                                    int64_t partner_rank);
+void register_group_buffer(fptr_t _fa,
+                           const std::vector<int64_t>& fake_ipc_ptrs);
 
 torch::Tensor hadacore_transform(torch::Tensor& x, bool inplace);
 

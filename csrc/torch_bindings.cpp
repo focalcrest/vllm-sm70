@@ -867,6 +867,11 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "int rank, bool fully_connected) -> int");
   custom_ar.impl("init_custom_ar", torch::kCUDA, &init_custom_ar);
   custom_ar.def(
+      "init_custom_ar_hierarchical(int[] ipc_tensors, Tensor rank_data, "
+      "int rank, int group_id, int local_rank, int partner_rank) -> int");
+  custom_ar.impl("init_custom_ar_hierarchical", torch::kCUDA,
+                 &init_custom_ar_hierarchical);
+  custom_ar.def(
       "all_reduce(int fa, Tensor inp, Tensor! out, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   custom_ar.impl("all_reduce", torch::kCUDA, &all_reduce);
@@ -875,6 +880,7 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
   custom_ar.def("meta_size", &meta_size);
 
   custom_ar.def("register_buffer", &register_buffer);
+  custom_ar.def("register_group_buffer", &register_group_buffer);
   custom_ar.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
   custom_ar.def("register_graph_buffers", &register_graph_buffers);
 

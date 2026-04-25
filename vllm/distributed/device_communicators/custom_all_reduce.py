@@ -71,6 +71,7 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        self.hierarchical = False
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -150,7 +151,26 @@ class CustomAllreduce:
         # this checks hardware and driver support for NVLink
         assert current_platform.is_cuda_alike()
         fully_connected = current_platform.is_fully_connected(physical_device_ids)
+        hierarchical = False
+        groups: list[list[int]] = []
         if world_size > 2 and not fully_connected:
+            groups = CustomAllreduce._detect_nvlink_groups(physical_device_ids)
+            if len(groups) == 2 and len(groups[0]) == len(groups[1]):
+                has_partners = all(
+                    CustomAllreduce._find_nvlink_partner(
+                        r, physical_device_ids, groups
+                    )
+                    is not None
+                    for r in range(world_size)
+                )
+                if has_partners:
+                    hierarchical = True
+                    logger.info(
+                        "Hierarchical custom allreduce enabled: %s with "
+                        "cross-group NVLink partners",
+                        groups,
+                    )
+        if world_size > 2 and not fully_connected and not hierarchical:
             logger.warning(
                 "Custom allreduce is disabled because it's not supported on"
                 " more than two PCIe-only GPUs. To silence this warning, "
@@ -191,10 +211,29 @@ class CustomAllreduce:
         self.rank = rank
         self.world_size = world_size
         self.fully_connected = fully_connected
-        self._ptr = ops.init_custom_ar(
-            self.meta_ptrs, self.rank_data, rank, self.fully_connected
-        )
-        ops.register_buffer(self._ptr, self.buffer_ptrs)
+        self.hierarchical = hierarchical
+        if hierarchical:
+            group_id = 0 if rank in groups[0] else 1
+            local_rank = groups[group_id].index(rank)
+            partner = CustomAllreduce._find_nvlink_partner(
+                rank, physical_device_ids, groups
+            )
+            assert partner is not None
+            self._ptr = ops.init_custom_ar_hierarchical(
+                self.meta_ptrs,
+                self.rank_data,
+                rank,
+                group_id,
+                local_rank,
+                partner,
+            )
+            ops.register_buffer(self._ptr, self.buffer_ptrs)
+            ops.register_group_buffer(self._ptr, self.buffer_ptrs)
+        else:
+            self._ptr = ops.init_custom_ar(
+                self.meta_ptrs, self.rank_data, rank, self.fully_connected
+            )
+            ops.register_buffer(self._ptr, self.buffer_ptrs)
 
     @contextmanager
     def capture(self):
@@ -243,6 +282,8 @@ class CustomAllreduce:
         # little performance improvement over NCCL.
         if self.world_size == 2 or self.fully_connected:
             return inp_size < self.max_size
+        if self.hierarchical:
+            return inp_size < self.max_size
         return False
 
     def all_reduce(
@@ -263,6 +304,106 @@ class CustomAllreduce:
                 self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
             )
         return out
+
+    @staticmethod
+    def _detect_nvlink_groups(
+        physical_device_ids: list[int],
+    ) -> list[list[int]]:
+        """Use NVML to detect NVLink connectivity and cluster GPUs into
+        fully-connected groups. For V100-SXM2 returns [[0,1,2,3], [4,5,6,7]]."""
+        import pynvml
+
+        pynvml.nvmlInit()
+        n = len(physical_device_ids)
+
+        # Build PCI bus ID → rank mapping
+        pci_bus_to_rank: dict[str, int] = {}
+        for rank, dev_id in enumerate(physical_device_ids):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
+            pci = pynvml.nvmlDeviceGetPciInfo(handle)
+            pci_bus_to_rank[pci.busId] = rank
+
+        # Find NVLink connections for each device
+        nvlink_adj: list[set[int]] = [set() for _ in range(n)]
+        for rank, dev_id in enumerate(physical_device_ids):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
+            for link in range(6):
+                try:
+                    if pynvml.nvmlDeviceGetNvLinkState(handle, link):
+                        remote_pci = pynvml.nvmlDeviceGetNvLinkRemotePciInfo(
+                            handle, link
+                        )
+                        remote_bus = remote_pci.busId
+                        if remote_bus in pci_bus_to_rank:
+                            nvlink_adj[rank].add(
+                                pci_bus_to_rank[remote_bus]
+                            )
+                except pynvml.NVMLError:
+                    continue
+        pynvml.nvmlShutdown()
+
+        # Cluster into fully-connected groups (greedy clique finding)
+        visited = [False] * n
+        groups: list[list[int]] = []
+        for i in range(n):
+            if visited[i]:
+                continue
+            group = [i]
+            visited[i] = True
+            for j in range(i + 1, n):
+                if not visited[j] and all(
+                    j in nvlink_adj[k] and k in nvlink_adj[j]
+                    for k in group
+                ):
+                    group.append(j)
+                    visited[j] = True
+            groups.append(group)
+        return groups
+
+    @staticmethod
+    def _find_nvlink_partner(
+        rank: int,
+        physical_device_ids: list[int],
+        groups: list[list[int]],
+    ) -> int | None:
+        """Find cross-group NVLink partner for a given rank.
+        V100: 0↔4, 1↔5, 2↔6, 3↔7"""
+        import pynvml
+
+        pynvml.nvmlInit()
+        my_phys = physical_device_ids[rank]
+        handle = pynvml.nvmlDeviceGetHandleByIndex(my_phys)
+
+        # Build PCI bus ID → rank mapping
+        pci_bus_to_rank: dict[str, int] = {}
+        for r, dev_id in enumerate(physical_device_ids):
+            h = pynvml.nvmlDeviceGetHandleByIndex(dev_id)
+            pci_bus_to_rank[pynvml.nvmlDeviceGetPciInfo(h).busId] = r
+
+        my_group_idx = next(
+            i for i, g in enumerate(groups) if rank in g
+        )
+        partner = None
+        for link in range(6):
+            try:
+                if pynvml.nvmlDeviceGetNvLinkState(handle, link):
+                    remote_pci = pynvml.nvmlDeviceGetNvLinkRemotePciInfo(
+                        handle, link
+                    )
+                    remote_rank = pci_bus_to_rank.get(remote_pci.busId)
+                    if remote_rank is not None and remote_rank != rank:
+                        other_group_idx = next(
+                            i
+                            for i, g in enumerate(groups)
+                            if remote_rank in g
+                        )
+                        if other_group_idx != my_group_idx:
+                            partner = remote_rank
+                            break
+            except pynvml.NVMLError:
+                continue
+        pynvml.nvmlShutdown()
+        return partner
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
         """The main allreduce API that provides support for cuda graph."""

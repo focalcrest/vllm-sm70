@@ -365,6 +365,67 @@ __global__ void __launch_bounds__(512, 1)
   }
 }
 
+template <typename T, int kGroupSize>
+__global__ void __launch_bounds__(512, 1)
+cross_device_reduce_hierarchical(
+    RankData* _dp, RankSignals group_sg, Signal* __restrict__ self_sg,
+    T* __restrict__ result, int local_rank, int size,
+    RankSignals cross_sg, int cross_rank,
+    const void* __restrict__ partner_tmp_ptr) {
+  using P = typename packed_t<T>::P;
+  using A = typename packed_t<T>::A;
+  auto dp = *_dp;
+  auto self_tmp = get_tmp_buf<P>(self_sg);
+  auto partner_tmp = reinterpret_cast<const P*>(partner_tmp_ptr);
+
+  // Phase 1: Intra-group 1-stage reduce → self_tmp
+  barrier_at_start<kGroupSize>(group_sg, self_sg, local_rank);
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+       idx += gridDim.x * blockDim.x) {
+    self_tmp[idx] = packed_reduce<P, kGroupSize, A>(
+        (const P**)&dp.ptrs[0], idx);
+  }
+  // Combined Phase 1 end + Phase 2 start barrier.
+  // Merges release/acquire group sync and volatile partner sync into
+  // one __syncthreads pair, saving 2 syncs per allreduce call.
+  {
+    __syncthreads();
+    const int b1 = blockIdx.x;
+    uint32_t f1 = self_sg->_flag[b1] + 1;
+    const int p2b = 18 + blockIdx.x;
+    uint32_t p2f = self_sg->_flag[p2b] + 1;
+    if (threadIdx.x < kGroupSize) {
+      st_flag_release(&group_sg.signals[threadIdx.x]->end[b1][local_rank], f1);
+      while (ld_flag_acquire(&self_sg->end[b1][threadIdx.x]) != f1);
+      if (threadIdx.x < 2) {
+        st_flag_release(&cross_sg.signals[threadIdx.x]->start[p2b][cross_rank], p2f);
+        while (ld_flag_acquire(&self_sg->start[p2b][threadIdx.x]) != p2f);
+      }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      self_sg->_flag[b1] = f1;
+      self_sg->_flag[p2b] = p2f;
+    }
+  }
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
+       idx += gridDim.x * blockDim.x) {
+    A v = upcast(self_tmp[idx]);
+    packed_assign_add(v, upcast(partner_tmp[idx]));
+    ((P*)result)[idx] = downcast<P>(v);
+  }
+  {
+    const int p2b = 18 + blockIdx.x;
+    __syncthreads();
+    uint32_t p2f = self_sg->_flag[p2b] + 1;
+    if (threadIdx.x < 2) {
+      st_flag_release(&cross_sg.signals[threadIdx.x]->end[p2b][cross_rank], p2f);
+      while (ld_flag_acquire(&self_sg->end[p2b][threadIdx.x]) != p2f);
+    }
+    if (threadIdx.x == 0) self_sg->_flag[p2b] = p2f;
+  }
+}
+
 using IPC_KEY = std::array<uint8_t, sizeof(cudaIpcMemHandle_t)>;
 static_assert(sizeof(IPC_KEY) == sizeof(cudaIpcMemHandle_t));
 static_assert(alignof(IPC_KEY) == alignof(cudaIpcMemHandle_t));
@@ -401,6 +462,16 @@ class CustomAllreduce {
   std::vector<void*> graph_unreg_buffers_;
   // a map from IPC handles to opened IPC pointers
   std::map<IPC_KEY, char*> ipc_handles_;
+
+  // Hierarchical all-reduce topology (for partial NVLink, e.g. V100-SXM2)
+  bool hierarchical_mode_ = false;
+  int group_id_ = -1;
+  int local_rank_ = -1;
+  int partner_rank_ = -1;
+  Signal* partner_signal_ = nullptr;
+  RankSignals group_sg_;
+  RankSignals cross_sg_;
+  RankData* d_group_rank_data_ = nullptr;
 
   /**
    * Signals are an array of ipc-enabled buffers from all ranks.
@@ -491,6 +562,34 @@ class CustomAllreduce {
     buffers_[ptrs[rank_]] = d_data;
   }
 
+  void init_hierarchical(int group_id, int local_rank, int partner_rank) {
+    hierarchical_mode_ = true;
+    group_id_ = group_id;
+    local_rank_ = local_rank;
+    partner_rank_ = partner_rank;
+    partner_signal_ = sg_.signals[partner_rank];
+
+    int group_start = group_id * 4;
+    for (int i = 0; i < 4; i++)
+      group_sg_.signals[i] = sg_.signals[group_start + i];
+
+    cross_sg_.signals[group_id] = self_sg_;
+    cross_sg_.signals[1 - group_id] = partner_signal_;
+  }
+
+  void register_group_buffer(void** ptrs) {
+    check_rank_data_capacity();
+    RankData data;
+    int group_start = group_id_ * 4;
+    for (int i = 0; i < 4; i++)
+      data.ptrs[i] = ptrs[group_start + i];
+    for (int i = 4; i < 8; i++)
+      data.ptrs[i] = nullptr;
+    d_group_rank_data_ = d_rank_data_base_++;
+    CUDACHECK(cudaMemcpy(d_group_rank_data_, &data,
+                          sizeof(RankData), cudaMemcpyHostToDevice));
+  }
+
   // Note: when registering graph buffers, we intentionally choose to not
   // deduplicate the addresses. That means if the allocator reuses some
   // addresses, they will be registered again. This is to account for the
@@ -567,6 +666,21 @@ class CustomAllreduce {
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
+
+    if (hierarchical_mode_) {
+      using P = typename packed_t<T>::P;
+      auto* partner_tmp = reinterpret_cast<P*>(
+          reinterpret_cast<char*>(partner_signal_) + sizeof(Signal));
+      // Cap at 18 blocks so Phase 2 slots (18+blockIdx.x) stay within
+      // kMaxBlocks=36
+      int hier_blocks = std::min(blocks, 18);
+      cross_device_reduce_hierarchical<T, 4>
+          <<<hier_blocks, threads, 0, stream>>>(
+              d_group_rank_data_, group_sg_, self_sg_,
+              reinterpret_cast<T*>(output), local_rank_,
+              size, cross_sg_, group_id_, partner_tmp);
+      return;
+    }
 
     // Check environment variable once
     const char* env_algo = std::getenv("VLLM_CUSTOM_ALLREDUCE_ALGO");
