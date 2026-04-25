@@ -385,21 +385,28 @@ cross_device_reduce_hierarchical(
     self_tmp[idx] = packed_reduce<P, kGroupSize, A>(
         (const P**)&dp.ptrs[0], idx);
   }
-  barrier_at_end<kGroupSize, false>(group_sg, self_sg, local_rank);
-
-  // Phase 2: Cross-group pairwise reduce → result
-  // Phase 1 uses slots 0..gridDim.x-1, Phase 2 uses 18+blockIdx.x
-  // to avoid races with the other group still being in Phase 1.
-  // Dispatch caps blocks at 18 so 18+blockIdx.x stays within kMaxBlocks=36.
+  // Combined Phase 1 end + Phase 2 start barrier.
+  // Merges release/acquire group sync and volatile partner sync into
+  // one __syncthreads pair, saving 2 syncs per allreduce call.
   {
+    __syncthreads();
+    const int b1 = blockIdx.x;
+    uint32_t f1 = self_sg->_flag[b1] + 1;
     const int p2b = 18 + blockIdx.x;
     uint32_t p2f = self_sg->_flag[p2b] + 1;
-    if (threadIdx.x < 2) {
-      st_flag_volatile(&cross_sg.signals[threadIdx.x]->start[p2b][cross_rank], p2f);
-      while (ld_flag_volatile(&self_sg->start[p2b][threadIdx.x]) != p2f);
+    if (threadIdx.x < kGroupSize) {
+      st_flag_release(&group_sg.signals[threadIdx.x]->end[b1][local_rank], f1);
+      while (ld_flag_acquire(&self_sg->end[b1][threadIdx.x]) != f1);
+      if (threadIdx.x < 2) {
+        st_flag_volatile(&cross_sg.signals[threadIdx.x]->start[p2b][cross_rank], p2f);
+        while (ld_flag_volatile(&self_sg->start[p2b][threadIdx.x]) != p2f);
+      }
     }
     __syncthreads();
-    if (threadIdx.x == 0) self_sg->_flag[p2b] = p2f;
+    if (threadIdx.x == 0) {
+      self_sg->_flag[b1] = f1;
+      self_sg->_flag[p2b] = p2f;
+    }
   }
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
        idx += gridDim.x * blockDim.x) {
