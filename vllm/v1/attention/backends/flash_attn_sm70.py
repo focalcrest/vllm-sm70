@@ -29,7 +29,6 @@ logger = init_logger(__name__)
 # Lazy imports: only resolve optional CUDA extensions when needed.
 _flash_attn_func = None
 _flash_attn_decode_paged = None
-_warned_prefill_fallback = False
 _warned_feature_fallback = False
 _warned_decode_fallback = False
 _warned_decode_runtime_fallback = False
@@ -74,7 +73,7 @@ def _is_cascade_supported(attn_metadata: TritonAttentionMetadata) -> bool:
 
 
 class FlashAttnSM70MetadataBuilder(TritonAttentionMetadataBuilder):
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build: bool = False):
         attn_metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
@@ -268,7 +267,7 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         global _logged_decode_flash, _logged_prefill_flash
-        global _warned_decode_fallback, _warned_prefill_fallback
+        global _warned_decode_fallback, _warned_decode_runtime_fallback
         global _warned_feature_fallback, _warned_missing_flash_ops
         global _warned_gqa_fallback, _warned_prefill_runtime_fallback
 
@@ -303,7 +302,6 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
             )
 
         is_prefill = attn_metadata.max_query_len > 1
-        is_capturing = query.is_cuda and torch.cuda.is_current_stream_capturing()
 
         if is_prefill:
             if query.shape[1] % key.shape[1] != 0:
@@ -315,23 +313,6 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
                         key.shape[1],
                     )
                     _warned_gqa_fallback = True
-                return super().forward(
-                    layer,
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata,
-                    output,
-                    output_scale,
-                    output_block_scale,
-                )
-            if is_capturing:
-                if not _warned_prefill_fallback:
-                    logger.warning(
-                        "FLASH_ATTN_SM70 prefill fallback during CUDA graph capture."
-                    )
-                    _warned_prefill_fallback = True
                 return super().forward(
                     layer,
                     query,

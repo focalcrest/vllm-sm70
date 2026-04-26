@@ -431,7 +431,7 @@ def rejection_sample(
     )
 
     # Rejection sampling for random sampling requests.
-    rejection_random_sample_kernel[(batch_size,)](
+    _rejection_random_sample(
         output_token_ids,
         cu_num_draft_tokens,
         draft_token_ids,
@@ -442,8 +442,8 @@ def rejection_sample(
         uniform_probs,
         is_greedy,
         max_spec_len,
-        vocab_size,
-        NO_DRAFT_PROBS=draft_probs is None,
+        num_draft_tokens,
+        batch_size,
     )
     return output_token_ids
 
@@ -615,9 +615,12 @@ def sample_recovered_tokens(
     sampling_metadata: SamplingMetadata,
     device: torch.device,
 ) -> torch.Tensor:
-    # NOTE(woosuk): Create only one distribution for each request.
+    # Pure-PyTorch implementation that avoids Triton JIT compilation
+    # on SM70 (where JIT takes >600s for this vocab-scanning kernel).
     batch_size = len(num_draft_tokens)
     vocab_size = target_probs.shape[-1]
+    num_tokens = draft_token_ids.shape[0]
+
     q = torch.empty(
         (batch_size, vocab_size),
         dtype=torch.float32,
@@ -625,27 +628,88 @@ def sample_recovered_tokens(
     )
     q.exponential_()
     for i, generator in sampling_metadata.generators.items():
-        # Do not generate random numbers for requests with no draft tokens.
-        # This can be important for reproducibility.
         if num_draft_tokens[i] > 0:
             q[i].exponential_(generator=generator)
 
     inv_q = q.reciprocal()
 
-    recovered_token_ids = torch.empty_like(draft_token_ids)
-    BLOCK_SIZE = 8192
-    sample_recovered_tokens_kernel[(batch_size, max_spec_len)](
-        recovered_token_ids,
-        cu_num_draft_tokens,
-        draft_token_ids,
-        draft_probs,
-        target_probs,
-        inv_q,
-        vocab_size,
-        BLOCK_SIZE,
-        NO_DRAFT_PROBS=draft_probs is None,
+    # Compute adjusted probabilities per token.
+    if draft_probs is None:
+        # Exclude the draft token from target_probs.
+        adjusted = target_probs.clone()
+        adjusted.scatter_(1, draft_token_ids.unsqueeze(1).long(), 0.0)
+    else:
+        adjusted = torch.clamp(target_probs - draft_probs, min=0.0)
+
+    # Expand inv_q [batch_size, vocab_size] → [num_tokens, vocab_size].
+    num_draft_tensor = torch.tensor(
+        num_draft_tokens, dtype=torch.long, device=device
     )
+    req_indices = torch.arange(batch_size, device=device).repeat_interleave(
+        num_draft_tensor
+    )
+    inv_q_expanded = inv_q[req_indices]
+
+    # argmax(adjusted_prob * inv_q) samples from the adjusted distribution
+    # (Gumbel-max trick with Exponential(1) noise).
+    recovered_token_ids = (adjusted * inv_q_expanded).argmax(dim=-1)
     return recovered_token_ids
+
+
+def _rejection_random_sample(
+    output_token_ids: torch.Tensor,
+    cu_num_draft_tokens: torch.Tensor,
+    draft_token_ids: torch.Tensor,
+    draft_probs: torch.Tensor | None,
+    target_probs: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    recovered_token_ids: torch.Tensor,
+    uniform_probs: torch.Tensor,
+    is_greedy: torch.Tensor | None,
+    max_spec_len: int,
+    num_draft_tokens: list[int],
+    batch_size: int,
+):
+    """Pure-PyTorch rejection sampling for random-sampling requests.
+
+    Avoids Triton JIT compilation which is prohibitively slow on SM70.
+    """
+    no_draft_probs = draft_probs is None
+
+    for req_idx in range(batch_size):
+        if is_greedy is not None and is_greedy[req_idx].item():
+            continue
+        start = (0 if req_idx == 0
+                 else cu_num_draft_tokens[req_idx - 1].item())
+        end = cu_num_draft_tokens[req_idx].item()
+        n_draft = end - start
+
+        rejected = False
+        for pos in range(n_draft):
+            if rejected:
+                continue
+            token_idx = start + pos
+            draft_id = draft_token_ids[token_idx].item()
+
+            if no_draft_probs:
+                draft_prob = 1.0
+            else:
+                draft_prob = draft_probs[token_idx, draft_id].item()
+            target_prob = target_probs[token_idx, draft_id].item()
+            uniform_prob = uniform_probs[token_idx].item()
+
+            if draft_prob > 0 and target_prob / draft_prob >= uniform_prob:
+                output_token_ids[req_idx, pos] = draft_id
+            else:
+                rejected = True
+                output_token_ids[req_idx, pos] = recovered_token_ids[
+                    token_idx
+                ].item()
+
+        if not rejected:
+            output_token_ids[req_idx, n_draft] = bonus_token_ids[
+                req_idx, 0
+            ].item()
 
 
 # NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.

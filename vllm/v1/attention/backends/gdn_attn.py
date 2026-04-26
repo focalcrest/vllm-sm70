@@ -312,6 +312,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             assert num_accepted_tokens is not None
             num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+            # Clamp to >= 1: the target token is always accepted, but the
+            # scheduler may report 0 before the first verification round.
+            # The recurrent kernel computes i_t = num_accepted - 1 for
+            # initial-state lookup, so 0 would produce i_t = -1 (OOB).
+            num_accepted_tokens = torch.clamp(num_accepted_tokens, min=1)
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
@@ -397,8 +402,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_query_start_loc = self.spec_query_start_loc[: batch_size + 1]
             spec_query_start_loc[num_spec_decodes + 1 :].fill_(spec_num_query_tokens)
 
+            # Clamp to >= 1: the target token is always accepted, but the
+            # scheduler may report 0 before the first verification round.
+            # The recurrent kernel computes i_t = num_accepted - 1 for
+            # initial-state lookup, so 0 would produce i_t = -1 (OOB).
+            clamped = torch.clamp(num_accepted_tokens, min=1)
             self.num_accepted_tokens[:num_spec_decodes].copy_(
-                num_accepted_tokens, non_blocking=True
+                clamped, non_blocking=True
             )
             num_accepted_tokens = self.num_accepted_tokens[:batch_size]
             num_accepted_tokens[num_spec_decodes:].fill_(1)

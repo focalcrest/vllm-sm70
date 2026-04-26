@@ -5640,18 +5640,42 @@ class GPUModelRunner(
             else:
                 raise e
         if self.speculative_config:
-            draft_token_ids = [[0] for _ in range(num_reqs)]
+            # Limit num_reqs for spec decode warmup to avoid OOM when
+            # creating large tensors (e.g., q = empty((num_reqs, vocab))).
+            # 4 requests is enough to compile all Triton kernels.
+            spec_warmup_reqs = min(num_reqs, 4)
+            draft_token_ids = [[0] for _ in range(spec_warmup_reqs)]
             dummy_spec_decode_metadata = SpecDecodeMetadata.make_dummy(
                 draft_token_ids, self.device
             )
 
+            spec_dummy_tensors = lambda v: torch.full(
+                (spec_warmup_reqs,), v, device=self.device)
+            spec_dummy_metadata = SamplingMetadata(
+                temperature=spec_dummy_tensors(0.5),
+                all_greedy=False,
+                all_random=False,
+                top_p=spec_dummy_tensors(0.9),
+                top_k=spec_dummy_tensors(logits.size(1) - 1),
+                generators={},
+                max_num_logprobs=None,
+                logprob_token_ids=None,
+                no_penalties=True,
+                prompt_token_ids=None,
+                frequency_penalties=spec_dummy_tensors(0.1),
+                presence_penalties=spec_dummy_tensors(0.1),
+                repetition_penalties=spec_dummy_tensors(0.1),
+                output_token_ids=[[] for _ in range(spec_warmup_reqs)],
+                spec_token_ids=[[] for _ in range(spec_warmup_reqs)],
+                allowed_token_ids_mask=None,
+                bad_words_token_ids={},
+                logitsprocs=LogitsProcessors(),
+            )
+
             num_tokens = sum(len(ids) for ids in draft_token_ids)
-            # draft_probs = torch.randn(
-            #     num_tokens, logits.shape[-1], device=self.device,
-            #     dtype=logits.dtype)
             draft_probs = None
-            logits = torch.randn(
-                num_tokens + num_reqs,
+            spec_logits = torch.randn(
+                num_tokens + spec_warmup_reqs,
                 logits.shape[-1],
                 device=self.device,
                 dtype=logits.dtype,
@@ -5659,8 +5683,8 @@ class GPUModelRunner(
             self.rejection_sampler(
                 dummy_spec_decode_metadata,
                 draft_probs,
-                logits,
-                dummy_metadata,
+                spec_logits,
+                spec_dummy_metadata,
             )
         return sampler_output
 
