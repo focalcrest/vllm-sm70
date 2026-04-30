@@ -130,6 +130,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASH_ATTN_SM70,
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
+                AttentionBackendEnum.TURBOQUANT,
             ]
         if device_capability.major == 10:
             return [

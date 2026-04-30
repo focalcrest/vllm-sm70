@@ -528,6 +528,8 @@ class Platform:
 
         if cache_config.cache_dtype == "auto":
             kv_cache_dtype = model_config.dtype
+        elif cache_config.cache_dtype.startswith("turboquant_"):
+            kv_cache_dtype = model_config.dtype
         else:
             kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
 
@@ -542,6 +544,39 @@ class Platform:
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
             ).page_size_bytes
+        elif cache_config.cache_dtype.startswith("turboquant_"):
+            # TQ has a packed K|V layout; the standard FullAttentionSpec
+            # formula over-sizes it. With mixed skip+TQ the skip layers
+            # still use the standard layout — take lcm so both are
+            # unifiable downstream.
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+            )
+            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
+
+            tq_cfg = TurboQuantConfig.from_cache_dtype(
+                cache_config.cache_dtype, model_config.get_head_size()
+            )
+            tq_page = TQFullAttentionSpec(
+                block_size=1,
+                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                head_size=model_config.get_head_size(),
+                head_size_v=model_config.get_head_size(),
+                dtype=kv_cache_dtype,
+                kv_quant_mode=kv_quant_mode,
+                tq_slot_size=tq_cfg.slot_size_aligned,
+            ).page_size_bytes
+            if cache_config.kv_cache_dtype_skip_layers:
+                skip_page = FullAttentionSpec(
+                    block_size=1,
+                    num_kv_heads=model_config.get_num_kv_heads(
+                        parallel_config),
+                    head_size=model_config.get_head_size(),
+                    dtype=model_config.dtype,
+                ).page_size_bytes
+                attn_page_size_1_token = lcm(tq_page, skip_page)
+            else:
+                attn_page_size_1_token = tq_page
         else:
             attn_page_size_1_token = FullAttentionSpec(
                 block_size=1,
