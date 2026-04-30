@@ -323,14 +323,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 prepare_chunk_indices,
                 prepare_chunk_offsets,
             )
-            from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
+            from vllm.model_executor.layers.fla.ops.utils import \
+                FLA_GDN_CHUNK_SIZE
 
             gpu_device = query_start_loc.device
             chunk_indices = prepare_chunk_indices(
-                non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
+                non_spec_query_start_loc_cpu, FLA_GDN_CHUNK_SIZE
             ).to(device=gpu_device, non_blocking=True)
             chunk_offsets = prepare_chunk_offsets(
-                non_spec_query_start_loc_cpu, FLA_CHUNK_SIZE
+                non_spec_query_start_loc_cpu, FLA_GDN_CHUNK_SIZE
             ).to(device=gpu_device, non_blocking=True)
 
         if num_prefills > 0:
