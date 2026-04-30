@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utility methods for model layers."""
 
+import os
 from collections.abc import Callable
 
 import torch
@@ -122,13 +123,20 @@ def maybe_sm70_projection(
 
     tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
     k_ld = getattr(layer, "_sm70_f16_k_ld", None)
-    if tm_weight is not None and k_ld is not None:
+    M = x_2d.size(0)
+    _sm70_max_m = int(os.environ.get("VLLM_SM70_F16_DENSE_MAX_M", "64"))
+    has_original_weight = layer.weight.numel() > 0
+    use_tm_kernel = (tm_weight is not None and k_ld is not None
+                     and (M <= _sm70_max_m or not has_original_weight))
+    if use_tm_kernel:
         output = torch.empty(
-            (x_2d.size(0), tm_weight.shape[0]),
+            (M, tm_weight.shape[0]),
             dtype=x_2d.dtype,
             device=x_2d.device,
         )
         ops.sm70_f16_gemm_out(output, x_2d, tm_weight, k_ld, False)
+    elif has_original_weight:
+        output = torch.nn.functional.linear(x_2d, layer.weight)
     else:
         output = torch.ops._C.sm70_f16_gemm(x_2d, layer.weight)
     output = output.reshape(*x.shape[:-1], output.shape[-1])

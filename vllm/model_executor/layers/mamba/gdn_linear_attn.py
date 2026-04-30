@@ -16,6 +16,7 @@ from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -621,6 +622,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         projected = maybe_sm70_projection(self.out_proj, core_attn_out)
         if projected is None:
             projected = self.out_proj(core_attn_out)
+        elif self.tp_size > 1:
+            projected = (tensor_model_parallel_all_reduce(projected[0]),
+                         projected[1])
         output[:num_tokens], _ = projected
 
     def forward_xpu(

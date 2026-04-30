@@ -20,6 +20,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -321,6 +322,9 @@ class Qwen3NextAttention(nn.Module):
         projected = maybe_sm70_projection(self.o_proj, attn_output)
         if projected is None:
             projected = self.o_proj(attn_output)
+        elif self.o_proj.reduce_results and self.o_proj.tp_size > 1:
+            projected = (tensor_model_parallel_all_reduce(projected[0]),
+                         projected[1])
         output[:], _ = projected
 
 
