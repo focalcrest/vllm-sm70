@@ -11,6 +11,9 @@ This backend keeps the strict fallback behavior from the 1cat prototype:
 from __future__ import annotations
 
 import torch
+from typing import ClassVar
+
+from vllm.config.cache import CacheDType
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from typing_extensions import override
 
@@ -113,6 +116,16 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         self._decode_cache_v: torch.Tensor | None = None
         self._decode_cache_len = 0
         self._decode_cache_capacity = 0
+        self._tq_config = None
+        if self._is_tq_cache():
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+            )
+            self._tq_config = TurboQuantConfig.from_cache_dtype(
+                self.kv_cache_dtype, self.head_size
+            )
+            # Note: FP8 keys (k8v4) don't need Hadamard rotation.
+            # MSE key paths would need self._tq_PiT = _build_hadamard(...).
 
     def _reset_decode_cache(self) -> None:
         self._decode_cache_k = None
@@ -164,6 +177,62 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
             and self.sinks is None
             and self.sliding_window == (-1, -1)
             and not self.kv_cache_dtype.startswith("fp8")
+        )
+
+    def _is_tq_cache(self) -> bool:
+        return self.kv_cache_dtype.startswith("turboquant_")
+
+    def _ensure_tq_on_device(self, layer: torch.nn.Module, device: torch.device):
+        """One-time derivation of TQ buffers for the layer."""
+        if hasattr(layer, "_tq_cached"):
+            return
+        from vllm.v1.attention.backends.turboquant_attn import _build_hadamard
+        D = self.head_size
+        H = _build_hadamard(D, str(device))
+        layer._tq_PiT = H  # H is already orthonormal (H = H^T)
+        if self._tq_config.key_fp8:
+            midpoints = torch.tensor([], device=device, dtype=torch.float32)
+        else:
+            n_bits = self._tq_config.key_mse_bits
+            levels = 1 << n_bits
+            midpoints = (torch.arange(levels - 1, device="cpu", dtype=torch.float32)
+                         + 0.5) * (2.0 / levels) - 1.0
+            midpoints = midpoints.to(device=device)
+        layer._tq_midpoints = midpoints
+        layer._tq_cached = True
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ):
+        if not self._is_tq_cache():
+            return super().do_kv_cache_update(
+                layer, key, value, kv_cache, slot_mapping
+            )
+        N = slot_mapping.shape[0]
+        if N <= 0:
+            return
+        self._ensure_tq_on_device(layer, key.device)
+        k = key[:N].view(N, self.num_kv_heads, self.head_size)
+        v = value[:N].view(N, self.num_kv_heads, self.head_size)
+        from vllm.v1.attention.ops.triton_turboquant_store import (
+            triton_turboquant_store,
+        )
+        triton_turboquant_store(
+            k,
+            v,
+            kv_cache,
+            slot_mapping,
+            layer._tq_PiT,
+            layer._tq_midpoints,
+            mse_bits=self._tq_config.key_mse_bits,
+            key_packed_size=self._tq_config.key_packed_size,
+            value_quant_bits=self._tq_config.effective_value_quant_bits,
+            key_fp8=self._tq_config.key_fp8,
         )
 
     def _flash_v100_cascade(
@@ -305,6 +374,18 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         is_prefill = attn_metadata.max_query_len > 1
         is_capturing = query.is_cuda and torch.cuda.is_current_stream_capturing()
 
+        if is_prefill and self._is_tq_cache():
+            # TQ prefill: first-chunk uses raw FP16 K/V with FA2 varlen.
+            # Continuation uses FA2 TQ decode kernel against compressed
+            # KV cache (per-request, synthetic seq_lens for causal mask).
+            if not _logged_prefill_flash:
+                logger.info("FLASH_ATTN_SM70 TQ prefill path active.")
+                _logged_prefill_flash = True
+            self._reset_decode_cache()
+            return self._tq_prefill(
+                query, key, value, kv_cache, attn_metadata, output
+            )
+
         if is_prefill:
             if query.shape[1] % key.shape[1] != 0:
                 if self.use_flash_v100 and not _warned_gqa_fallback:
@@ -424,12 +505,15 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
             return self._flash_v100_decode(
                 query, key, value, kv_cache, attn_metadata, output
             )
-        except (RuntimeError, ValueError, IndexError):
+        except (RuntimeError, ValueError, IndexError) as e:
+            logger.warning(
+                "FLASH_ATTN_SM70 decode op failed at runtime (%s: %s); "
+                "disabling and falling back to Triton.",
+                type(e).__name__, e,
+            )
             self.use_flash_v100_decode = False
             if self.use_flash_v100 and not _warned_decode_runtime_fallback:
-                logger.warning(
-                    "FLASH_ATTN_SM70 decode op failed at runtime; disabling the decode hook and falling back to Triton."
-                )
+                _warned_decode_runtime_fallback = True
                 _warned_decode_runtime_fallback = True
             return super().forward(
                 layer,
@@ -442,6 +526,105 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
                 output_scale,
                 output_block_scale,
             )
+
+    def _tq_prefill(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """TQ prefill: first-chunk uses raw FP16 K/V, continuation uses
+        FA2 TQ decode kernel against compressed KV cache."""
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        query = query[:num_actual_tokens]
+        key = key[:num_actual_tokens]
+        value = value[:num_actual_tokens]
+        out_view = output[:num_actual_tokens]
+
+        # First-chunk fast path: all K/V in batch
+        if attn_metadata.max_query_len == attn_metadata.max_seq_len:
+            self.flash_attn_func(
+                q=query,
+                k=key,
+                v=value,
+                out=out_view,
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                cu_seqlens_k=attn_metadata.query_start_loc,
+                max_seqlen_q=attn_metadata.max_query_len,
+                max_seqlen_k=attn_metadata.max_query_len,
+                softmax_scale=self.scale,
+                causal=True,
+            )
+
+            return output
+
+        # Continuation: use FA2 TQ decode kernel per request.
+        # The KV cache already contains all tokens (previous + current chunk
+        # was stored by do_kv_cache_update). Treat each query position as a
+        # decode request with incremental seq_lens for causal masking.
+        query_start_loc_cpu = getattr(
+            attn_metadata, "query_start_loc_cpu", None
+        )
+        query_start_loc = (
+            query_start_loc_cpu
+            if query_start_loc_cpu is not None
+            else attn_metadata.query_start_loc
+        )
+        seq_lens = attn_metadata.seq_lens
+        num_seqs = len(query_start_loc) - 1
+
+        for i in range(num_seqs):
+            start = int(query_start_loc[i].item())
+            end = int(query_start_loc[i + 1].item())
+            if end <= start:
+                continue
+            q_len = end - start
+            seq_len = int(seq_lens[i].item())
+            cached_len = seq_len - q_len
+            if cached_len <= 0:
+                # No prior cache — first chunk for this request
+                seqlen = q_len
+                cu_seqlens = torch.tensor(
+                    [0, seqlen], dtype=torch.int32, device=query.device
+                )
+                out_seq = self.flash_attn_func(
+                    query[start:end],
+                    key[start:end],
+                    value[start:end],
+                    seqlen,
+                    cu_seqlens,
+                    seqlen,
+                    cu_seqlens_k=cu_seqlens,
+                    softmax_scale=self.scale,
+                    causal=True,
+                )
+                out_view[start:end].copy_(out_seq)
+                continue
+
+            # Synthesize per-token seq_lens for causal decode.
+            # Each query token i sees all K/V up to cached_len + i + 1.
+            synth_seq_lens = torch.arange(
+                cached_len + 1,
+                seq_len + 1,
+                device=query.device,
+                dtype=seq_lens.dtype,
+            )
+            synth_bt = attn_metadata.block_table[i : i + 1].expand(
+                q_len, -1
+            )
+            self.flash_attn_decode_paged(
+                query[start:end],
+                kv_cache,
+                kv_cache,
+                synth_bt,
+                synth_seq_lens,
+                softmax_scale=self.scale,
+                out=out_view[start:end],
+            )
+        return output
 
     def _flash_v100_prefill(
         self,
@@ -505,7 +688,12 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         if query.shape[0] == 0:
             return output
 
-        if kv_cache.shape[0] == 2:
+        if self._is_tq_cache():
+            # TQ: single combined uint8 cache [num_blocks, page_block_size, num_heads_k, slot_size]
+            # Both k_cache and v_cache point to the same slot data
+            key_cache = kv_cache
+            value_cache = kv_cache
+        elif kv_cache.shape[0] == 2:
             key_cache, value_cache = kv_cache.unbind(0)
         else:
             key_cache, value_cache = kv_cache.unbind(1)
@@ -527,6 +715,13 @@ class FlashAttnSM70Backend(TritonAttentionBackend):
 
     forward_includes_kv_cache_update: bool = False
 
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
+        "auto",
+        "float16",
+        "bfloat16",
+        "turboquant_k8v4",
+    ]
+
     @staticmethod
     def get_impl_cls():
         return FlashAttnSM70Impl
@@ -542,6 +737,43 @@ class FlashAttnSM70Backend(TritonAttentionBackend):
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 80, 96, 112, 128, 256]
+
+    @staticmethod
+    def get_kv_cache_shape(
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if cache_dtype_str.startswith("turboquant_"):
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+            )
+
+            tq_config = TurboQuantConfig.from_cache_dtype(
+                cache_dtype_str, head_size
+            )
+            return (
+                num_blocks,
+                block_size,
+                num_kv_heads,
+                tq_config.slot_size_aligned,
+            )
+        return TritonAttentionBackend.get_kv_cache_shape(
+            num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str
+        )
+
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        if cache_dtype_str.startswith("turboquant_"):
+            return (0, 1, 2, 3)
+        return TritonAttentionBackend.get_kv_cache_stride_order(
+            include_num_layers_dimension
+        )
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
