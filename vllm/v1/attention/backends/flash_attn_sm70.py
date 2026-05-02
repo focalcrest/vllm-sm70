@@ -542,7 +542,7 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         output: torch.Tensor,
     ) -> torch.Tensor:
         """TQ prefill: first-chunk uses raw FP16 K/V, continuation uses
-        FA2 TQ decode kernel against compressed KV cache."""
+        FA2 prefill kernel with paged TQ KV cache (batched varlen)."""
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
         key = key[:num_actual_tokens]
@@ -566,9 +566,7 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
 
             return output
 
-        # Continuation: use FA2 prefill kernel with paged TQ KV cache.
-        # Each request gets one kernel launch with tiled Q processing instead
-        # of per-token decode — full flash attention throughput.
+        # Mixed or continuation: separate first-chunk vs continuation requests.
         query_start_loc_cpu = getattr(
             attn_metadata, "query_start_loc_cpu", None
         )
@@ -580,6 +578,8 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         seq_lens = attn_metadata.seq_lens
         num_seqs = len(query_start_loc) - 1
 
+        first_indices = []
+        cont_indices = []
         for i in range(num_seqs):
             start = int(query_start_loc[i].item())
             end = int(query_start_loc[i + 1].item())
@@ -587,41 +587,85 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
                 continue
             q_len = end - start
             seq_len = int(seq_lens[i].item())
-            cached_len = seq_len - q_len
-            if cached_len <= 0:
-                # No prior cache — first chunk for this request
-                seqlen = q_len
-                cu_seqlens = torch.tensor(
-                    [0, seqlen], dtype=torch.int32, device=query.device
-                )
-                out_seq = self.flash_attn_func(
-                    query[start:end],
-                    key[start:end],
-                    value[start:end],
-                    seqlen,
-                    cu_seqlens,
-                    seqlen,
-                    cu_seqlens_k=cu_seqlens,
-                    softmax_scale=self.scale,
-                    causal=True,
-                )
-                out_view[start:end].copy_(out_seq)
-                continue
+            if seq_len - q_len <= 0:
+                first_indices.append(i)
+            else:
+                cont_indices.append(i)
 
-            # Tiled prefill against paged TQ KV cache — one kernel launch.
-            q_seq = query[start:end]  # [q_len, num_heads, head_dim]
-            bt = attn_metadata.block_table[i : i + 1]
-            seqlen_k_tensor = torch.tensor(
-                [seq_len], dtype=torch.int32, device=query.device
+        # First-chunk requests: batched varlen with raw FP16 K/V.
+        if first_indices:
+            q_parts, kv_parts = [], []
+            cu_q_first = torch.zeros(
+                len(first_indices) + 1, dtype=torch.int32, device=query.device
             )
-            self.flash_attn_prefill_paged(
-                q_seq,
-                kv_cache,
-                bt,
-                seqlen_k_tensor,
+            for j, i in enumerate(first_indices):
+                s = int(query_start_loc[i].item())
+                e = int(query_start_loc[i + 1].item())
+                q_parts.append(query[s:e])
+                kv_parts.append(key[s:e])
+                cu_q_first[j + 1] = cu_q_first[j] + (e - s)
+            q_first = torch.cat(q_parts, dim=0)
+            k_first = torch.cat(kv_parts, dim=0)
+            v_first = torch.cat(
+                [value[int(query_start_loc[i].item()):int(query_start_loc[i+1].item())]
+                 for i in first_indices], dim=0
+            )
+            max_q_first = int(cu_q_first[-1].item()) // len(first_indices) if first_indices else 1
+            max_q_first = max(
+                int(query_start_loc[i+1].item()) - int(query_start_loc[i].item())
+                for i in first_indices
+            )
+            out_first = self.flash_attn_func(
+                q=q_first, k=k_first, v=v_first,
+                cu_seqlens_q=cu_q_first, cu_seqlens_k=cu_q_first,
+                max_seqlen_q=max_q_first, max_seqlen_k=max_q_first,
+                softmax_scale=self.scale, causal=True,
+            )
+            offset = 0
+            for i in first_indices:
+                s = int(query_start_loc[i].item())
+                qlen = int(query_start_loc[i + 1].item()) - s
+                out_view[s:s + qlen].copy_(out_first[offset:offset + qlen])
+                offset += qlen
+
+        # Continuation requests: single batched varlen call with paged TQ KV.
+        if cont_indices:
+            q_parts = []
+            cu_q_cont = torch.zeros(
+                len(cont_indices) + 1, dtype=torch.int32, device=query.device
+            )
+            for j, i in enumerate(cont_indices):
+                s = int(query_start_loc[i].item())
+                e = int(query_start_loc[i + 1].item())
+                q_parts.append(query[s:e])
+                cu_q_cont[j + 1] = cu_q_cont[j] + (e - s)
+            q_cont = torch.cat(q_parts, dim=0)
+
+            cont_bt = attn_metadata.block_table[cont_indices]
+            cont_seq_lens = seq_lens[cont_indices]
+            max_q_cont = max(
+                int(query_start_loc[i+1].item()) - int(query_start_loc[i].item())
+                for i in cont_indices
+            )
+            max_seq_cont = int(cont_seq_lens.max().item())
+
+            out_cont = self.flash_attn_func(
+                q=q_cont, k=kv_cache, v=kv_cache,
+                cu_seqlens_q=cu_q_cont,
+                seqused_k=cont_seq_lens,
+                block_table=cont_bt,
+                max_seqlen_q=max_q_cont,
+                max_seqlen_k=max_seq_cont,
                 softmax_scale=self.scale,
-                out=out_view[start:end].unsqueeze(0),
+                causal=True,
             )
+            offset = 0
+            for i in cont_indices:
+                s = int(query_start_loc[i].item())
+                qlen = int(query_start_loc[i + 1].item()) - s
+                out_view[s:s + qlen].copy_(out_cont[offset:offset + qlen])
+                offset += qlen
+
         return output
 
     def _flash_v100_prefill(
