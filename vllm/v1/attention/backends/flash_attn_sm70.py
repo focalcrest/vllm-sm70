@@ -32,6 +32,7 @@ logger = init_logger(__name__)
 # Lazy imports: only resolve optional CUDA extensions when needed.
 _flash_attn_func = None
 _flash_attn_decode_paged = None
+_flash_attn_prefill_paged = None
 _warned_prefill_fallback = False
 _warned_feature_fallback = False
 _warned_decode_fallback = False
@@ -45,20 +46,23 @@ _logged_decode_flash = False
 
 def _get_flash_ops():
     """Lazy-load package-local SM70 flash-attn ops if available."""
-    global _flash_attn_func, _flash_attn_decode_paged
+    global _flash_attn_func, _flash_attn_decode_paged, _flash_attn_prefill_paged
     if _flash_attn_func is None or _flash_attn_decode_paged is None:
         try:
             from vllm.vllm_flash_attn_sm70 import (  # type: ignore[attr-defined]
                 flash_attn_decode_paged,
                 flash_attn_func,
+                flash_attn_prefill_paged,
             )
         except ImportError:
             _flash_attn_func = None
             _flash_attn_decode_paged = None
+            _flash_attn_prefill_paged = None
         else:
             _flash_attn_func = flash_attn_func
             _flash_attn_decode_paged = flash_attn_decode_paged
-    return _flash_attn_func, _flash_attn_decode_paged
+            _flash_attn_prefill_paged = flash_attn_prefill_paged
+    return _flash_attn_func, _flash_attn_decode_paged, _flash_attn_prefill_paged
 
 
 def _has_prefix_context(attn_metadata: TritonAttentionMetadata) -> bool:
@@ -109,9 +113,10 @@ class FlashAttnSM70MetadataBuilder(TritonAttentionMetadataBuilder):
 class FlashAttnSM70Impl(TritonAttentionImpl):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.flash_attn_func, self.flash_attn_decode_paged = _get_flash_ops()
+        self.flash_attn_func, self.flash_attn_decode_paged, self.flash_attn_prefill_paged = _get_flash_ops()
         self.use_flash_v100 = self.flash_attn_func is not None
         self.use_flash_v100_decode = self.flash_attn_decode_paged is not None
+        self.use_flash_v100_prefill_paged = self.flash_attn_prefill_paged is not None
         self._decode_cache_k: torch.Tensor | None = None
         self._decode_cache_v: torch.Tensor | None = None
         self._decode_cache_len = 0
@@ -561,10 +566,9 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
 
             return output
 
-        # Continuation: use FA2 TQ decode kernel per request.
-        # The KV cache already contains all tokens (previous + current chunk
-        # was stored by do_kv_cache_update). Treat each query position as a
-        # decode request with incremental seq_lens for causal masking.
+        # Continuation: use FA2 prefill kernel with paged TQ KV cache.
+        # Each request gets one kernel launch with tiled Q processing instead
+        # of per-token decode — full flash attention throughput.
         query_start_loc_cpu = getattr(
             attn_metadata, "query_start_loc_cpu", None
         )
@@ -604,25 +608,19 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
                 out_view[start:end].copy_(out_seq)
                 continue
 
-            # Synthesize per-token seq_lens for causal decode.
-            # Each query token i sees all K/V up to cached_len + i + 1.
-            synth_seq_lens = torch.arange(
-                cached_len + 1,
-                seq_len + 1,
-                device=query.device,
-                dtype=seq_lens.dtype,
+            # Tiled prefill against paged TQ KV cache — one kernel launch.
+            q_seq = query[start:end]  # [q_len, num_heads, head_dim]
+            bt = attn_metadata.block_table[i : i + 1]
+            seqlen_k_tensor = torch.tensor(
+                [seq_len], dtype=torch.int32, device=query.device
             )
-            synth_bt = attn_metadata.block_table[i : i + 1].expand(
-                q_len, -1
-            )
-            self.flash_attn_decode_paged(
-                query[start:end],
+            self.flash_attn_prefill_paged(
+                q_seq,
                 kv_cache,
-                kv_cache,
-                synth_bt,
-                synth_seq_lens,
+                bt,
+                seqlen_k_tensor,
                 softmax_scale=self.scale,
-                out=out_view[start:end],
+                out=out_view[start:end].unsqueeze(0),
             )
         return output
 

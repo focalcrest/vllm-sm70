@@ -379,3 +379,88 @@ def flash_attn_decode_paged(
     if out is not None:
         return out
     return out_tensors[0]
+
+
+def flash_attn_prefill_paged(
+    q,
+    kv_cache,
+    block_table,
+    seqlen_k,
+    *,
+    out=None,
+    softmax_scale=None,
+    causal=True,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+    rotary_interleaved=True,
+):
+    """Paged prefill wrapper for SM70 FlashAttention with TQ KV cache.
+
+    Unlike ``flash_attn_decode_paged`` (which processes a single Q token per
+    batch entry), this function handles multi-token Q with paged KV — used for
+    continuation prefill where cached tokens sit in the TQ paged KV cache and
+    new Q tokens need tiled flash-attention processing.
+
+    Args:
+        q: [q_len, num_heads, head_dim] or [1, q_len, num_heads, head_dim].
+        kv_cache: Paged KV cache (uint8 for TQ).
+        block_table: [1, max_num_pages] int32 block table.
+        seqlen_k: [1] int32 — full sequence length (cached + new).
+        out: Optional pre-allocated output tensor.
+        softmax_scale: Scale for attention. Defaults to 1/sqrt(head_dim).
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    q = maybe_contiguous(q)
+    kv_cache = maybe_contiguous(kv_cache)
+    block_table = _maybe_int32_contiguous(block_table)
+    seqlen_k = _maybe_int32_contiguous(seqlen_k)
+    alibi_slopes = maybe_contiguous(alibi_slopes)
+
+    if q.dim() == 3:
+        q = q.unsqueeze(0)  # [q_len, H, D] → [1, q_len, H, D]
+
+    if q.dim() != 4 or q.shape[0] != 1:
+        raise ValueError(
+            "flash_attn_prefill_paged expects q shaped [q_len, num_heads, head_dim] "
+            f"or [1, q_len, num_heads, head_dim]; got {tuple(q.shape)}"
+        )
+
+    if out is not None:
+        out = maybe_contiguous(out)
+        if out.dim() == 3:
+            out = out.unsqueeze(0)  # [q_len, H, D] → [1, q_len, H, D]
+        if out.dim() != 4 or out.shape[0] != 1:
+            raise ValueError(
+                "flash_attn_prefill_paged expects out shaped [q_len, num_heads, head_dim] "
+                f"or [1, q_len, num_heads, head_dim]; got {tuple(out.shape)}"
+            )
+
+    out_tensors = torch.ops._vllm_fa2_sm70_C.fwd_kvcache(
+        q,
+        kv_cache,
+        kv_cache,  # v_cache same as k_cache (TQ unified)
+        None,  # k_new
+        None,  # v_new
+        seqlen_k,
+        None,  # rotary_cos
+        None,  # rotary_sin
+        None,  # cache_batch_idx
+        None,  # leftpad_k
+        block_table,
+        alibi_slopes,
+        out,
+        softmax_scale,
+        causal,
+        window_size[0],
+        window_size[1],
+        softcap,
+        rotary_interleaved,
+        1,  # num_splits=1 → prefill kernel (not split-KV decode)
+    )
+
+    if out is not None:
+        return out
+    return out_tensors[0]
