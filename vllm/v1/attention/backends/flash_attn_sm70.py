@@ -628,9 +628,11 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
                 out_view[s:s + qlen].copy_(out_first[offset:offset + qlen])
                 offset += qlen
 
-        # Continuation requests: single batched varlen call with paged TQ KV.
+        # Continuation requests: hybrid TQ + raw FP16 K/V.
+        # Cached tokens are read from TQ paged cache (dequantize in kernel).
+        # Current-chunk tokens are read from raw FP16 (fast CuTe async copy).
         if cont_indices:
-            q_parts = []
+            q_parts, k_parts, v_parts = [], [], []
             cu_q_cont = torch.zeros(
                 len(cont_indices) + 1, dtype=torch.int32, device=query.device
             )
@@ -638,8 +640,12 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
                 s = int(query_start_loc[i].item())
                 e = int(query_start_loc[i + 1].item())
                 q_parts.append(query[s:e])
+                k_parts.append(key[s:e])
+                v_parts.append(value[s:e])
                 cu_q_cont[j + 1] = cu_q_cont[j] + (e - s)
             q_cont = torch.cat(q_parts, dim=0)
+            k_cont = torch.cat(k_parts, dim=0)
+            v_cont = torch.cat(v_parts, dim=0)
 
             cont_bt = attn_metadata.block_table[cont_indices]
             cont_seq_lens = seq_lens[cont_indices]
@@ -648,6 +654,10 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
                 for i in cont_indices
             )
             max_seq_cont = int(cont_seq_lens.max().item())
+
+            # Per-request cached token count: seq_len - q_len
+            q_lens = cu_q_cont[1:] - cu_q_cont[:-1]
+            cached_lens = cont_seq_lens.to(device=query.device, dtype=torch.int32) - q_lens
 
             out_cont = self.flash_attn_func(
                 q=q_cont, k=kv_cache, v=kv_cache,
@@ -658,6 +668,9 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
                 max_seqlen_k=max_seq_cont,
                 softmax_scale=self.scale,
                 causal=True,
+                k_raw=k_cont,
+                v_raw=v_cont,
+                tq_cached_lens=cached_lens,
             )
             offset = 0
             for i in cont_indices:

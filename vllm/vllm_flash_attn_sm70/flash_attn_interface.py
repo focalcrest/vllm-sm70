@@ -152,6 +152,10 @@ def flash_attn_varlen_func(
     cp_world_size=1,
     cp_rank=0,
     cp_tot_seqused_k=None,
+    # Hybrid TQ + raw FP16 K/V for continuation prefill
+    k_raw=None,
+    v_raw=None,
+    tq_cached_lens=None,
 ):
     """dropout_p should be set to 0.0 during evaluation
     Supports multi-query and grouped-query attention (MQA/GQA) by passing in K, V with fewer heads
@@ -260,6 +264,9 @@ def flash_attn_varlen_func(
             return_softmax_lse and dropout_p > 0,
             num_splits,
             None,
+            k_raw,
+            v_raw,
+            tq_cached_lens,
         )
     elif fa_version == 3:
         assert alibi_slopes is None, "Alibi is not supported in FA3"
