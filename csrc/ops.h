@@ -222,6 +222,16 @@ void sm70_f16_gemm_out(torch::Tensor out, torch::Tensor _in_feats,
                        torch::Tensor _kernel, int64_t k_ld,
                        bool gated_silu);
 
+// W8A16 SM70 weight-only INT8 GEMM
+std::vector<torch::Tensor> w8a16_sm70_prepare(torch::Tensor weight_u8,
+                                               torch::Tensor scales_f16,
+                                               int64_t group_size);
+
+void w8a16_sm70_gemm_out(torch::Tensor out, torch::Tensor _in_feats,
+                         torch::Tensor _kernel, torch::Tensor _scaling_factors,
+                         int64_t group_size, int64_t w_ld, int64_t s_ld,
+                         bool gated_silu);
+
 std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
     torch::Tensor tm_weights, torch::Tensor tm_scales, int64_t k_ld,
     int64_t q_ld, int64_t num_experts);

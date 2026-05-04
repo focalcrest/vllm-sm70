@@ -141,4 +141,21 @@ void awq_moe_gemm_sm70_out(torch::Tensor,
   awq_sm70_unavailable();
 }
 
+std::vector<torch::Tensor> w8a16_sm70_prepare(torch::Tensor,
+                                               torch::Tensor,
+                                               int64_t) {
+  awq_sm70_unavailable();
+}
+
+void w8a16_sm70_gemm_out(torch::Tensor out,
+                         torch::Tensor,
+                         torch::Tensor,
+                         torch::Tensor,
+                         int64_t,
+                         int64_t,
+                         int64_t,
+                         bool) {
+  awq_sm70_unavailable();
+}
+
 #endif  // USE_ROCM

@@ -41,6 +41,7 @@ QuantizationMethods = Literal[
     "fp8_per_tensor",
     "fp8_per_block",
     "int8_per_channel_weight_only",
+    "w8a16_sm70",
 ]
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
@@ -138,6 +139,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
     from .mxfp8 import Mxfp8Config
     from .online.base import OnlineQuantizationConfig
     from .torchao import TorchAOConfig
+    from .w8a16_sm70 import W8A16SM70Config
 
     method_to_config: dict[str, type[QuantizationConfig]] = {
         "awq": AWQConfig,
@@ -165,6 +167,7 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "mxfp8": Mxfp8Config,
         "cpu_awq": CPUAWQConfig,
         "online": OnlineQuantizationConfig,
+        "w8a16_sm70": W8A16SM70Config,
     }
 
     # Below are values of the OnlineQuantScheme enum. This is here to provide

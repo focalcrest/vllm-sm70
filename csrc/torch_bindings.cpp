@@ -329,6 +329,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int num_experts, int k, int n, int group_size, bool gated_silu) -> ()");
   ops.impl("awq_moe_gemm_sm70_out", torch::kCUDA, &awq_moe_gemm_sm70_out);
 
+  // W8A16 weight-only INT8 GEMM for SM70
+  ops.def(
+      "w8a16_sm70_prepare(Tensor weight_u8, Tensor scales_f16, "
+      "int group_size) -> Tensor[]");
+  ops.impl("w8a16_sm70_prepare", torch::kCUDA, &w8a16_sm70_prepare);
+
+  ops.def(
+      "w8a16_sm70_gemm_out(Tensor(a!) out, Tensor _in_feats, Tensor _kernel, "
+      "Tensor _scaling_factors, int group_size, int w_ld, int s_ld, "
+      "bool gated_silu) -> ()");
+  ops.impl("w8a16_sm70_gemm_out", torch::kCUDA, &w8a16_sm70_gemm_out);
+
   // Dequantization for AWQ.
   ops.def(
       "awq_dequantize(Tensor _kernel, Tensor _scaling_factors, "

@@ -388,8 +388,10 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
         "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/tuner/params.cc"
         "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_4.cu"
         "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_16.cu"
+        "${VLLM_TURBOMIND_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_u8.cu"
         "csrc/quantization/awq/tm_registry_sm70.cu"
-        "csrc/quantization/awq/awq_sm70_gemm.cu")
+        "csrc/quantization/awq/awq_sm70_gemm.cu"
+        "csrc/quantization/w8a16/w8a16_sm70_gemm.cu")
       set_gencode_flags_for_srcs(
         SRCS "${AWQ_SM70_TURBOMIND_SRCS}"
         CUDA_ARCHS "${AWQ_SM70_ARCHS}")

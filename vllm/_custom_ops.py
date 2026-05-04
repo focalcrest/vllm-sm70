@@ -841,6 +841,63 @@ if hasattr(torch.ops._C, "awq_gemm_sm70_out"):
         return None
 
 
+# ---------------------------------------------------------------------------
+# W8A16 SM70 weight-only INT8 GEMM
+# ---------------------------------------------------------------------------
+
+def w8a16_sm70_prepare(
+    weight_u8: torch.Tensor,
+    scales_f16: torch.Tensor,
+    group_size: int,
+) -> list[torch.Tensor]:
+    return torch.ops._C.w8a16_sm70_prepare(weight_u8, scales_f16, group_size)
+
+
+if hasattr(torch.ops._C, "w8a16_sm70_prepare"):
+
+    @register_fake("_C::w8a16_sm70_prepare")
+    def _w8a16_sm70_prepare_fake(
+        weight_u8: torch.Tensor,
+        scales_f16: torch.Tensor,
+        group_size: int,
+    ) -> list[torch.Tensor]:
+        tm_weight = torch.empty_like(weight_u8)
+        tm_scales = torch.empty_like(scales_f16.view(torch.uint8))
+        meta = torch.empty((2,), dtype=torch.int64, device=weight_u8.device)
+        return [tm_weight, tm_scales, meta]
+
+
+def w8a16_sm70_gemm_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    tm_weight: torch.Tensor,
+    tm_scales: torch.Tensor,
+    group_size: int,
+    w_ld: int,
+    s_ld: int,
+    gated_silu: bool = False,
+) -> None:
+    torch.ops._C.w8a16_sm70_gemm_out(
+        out, input, tm_weight, tm_scales, group_size, w_ld, s_ld, gated_silu
+    )
+
+
+if hasattr(torch.ops._C, "w8a16_sm70_gemm_out"):
+
+    @register_fake("_C::w8a16_sm70_gemm_out")
+    def _w8a16_sm70_gemm_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        tm_weight: torch.Tensor,
+        tm_scales: torch.Tensor,
+        group_size: int,
+        w_ld: int,
+        s_ld: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
 def awq_moe_build_strided_ptrs(
     tm_weights: torch.Tensor,
     tm_scales: torch.Tensor,

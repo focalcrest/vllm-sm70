@@ -13,6 +13,7 @@ Registry::Registry(std::shared_ptr<cudaDeviceProp> device_prop):
     // AWQ uint4 and dense fp16 Tensor Core paths.
     sm70_884_4();
     sm70_884_16();
+    sm70_884_u8();
 }
 
 bool Registry::Add(std::unique_ptr<Kernel> kernel)
