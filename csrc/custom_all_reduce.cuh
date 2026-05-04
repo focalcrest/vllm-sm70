@@ -667,7 +667,10 @@ class CustomAllreduce {
     auto bytes = size * sizeof(typename packed_t<T>::P);
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
 
-    if (hierarchical_mode_) {
+    // Hierarchical mode is not cudagraph-compatible: it uses
+    // d_group_rank_data_ which is never updated with graph buffer
+    // addresses. Fall through to the flat path during capture.
+    if (hierarchical_mode_ && status != cudaStreamCaptureStatusActive) {
       using P = typename packed_t<T>::P;
       auto* partner_tmp = reinterpret_cast<P*>(
           reinterpret_cast<char*>(partner_signal_) + sizeof(Signal));
