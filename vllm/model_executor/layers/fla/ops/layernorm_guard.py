@@ -315,7 +315,6 @@ def layernorm_fn(
     )
 
 
-@input_guard
 def rmsnorm_fn(
     x,
     weight,
