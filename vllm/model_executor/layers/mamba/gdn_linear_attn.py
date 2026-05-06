@@ -613,12 +613,13 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # Part 3: Output Projection
         # ============================================================
         z_shape_og = z.shape
-        # Reshape input data into 2D tensor
+        # Reshape to 2D: flatten heads into rows for per-head RMS norm
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
+        # Reshape back to 3D then flatten to 2D for out_proj
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        core_attn_out = core_attn_out.reshape(core_attn_out.size(0), -1)
         projected = maybe_sm70_projection(self.out_proj, core_attn_out)
         if projected is None:
             projected = self.out_proj(core_attn_out)
@@ -703,12 +704,13 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
         # Part 3: Output Projection
         # ============================================================
         z_shape_og = z.shape
-        # Reshape input data into 2D tensor
+        # Reshape to 2D: flatten heads into rows for per-head RMS norm
         core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
         z = z.reshape(-1, z.shape[-1])
         core_attn_out = self.norm(core_attn_out, z)
+        # Reshape back to 3D then flatten to 2D for out_proj
         core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
+        core_attn_out = core_attn_out.reshape(core_attn_out.size(0), -1)
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
     def _warmup_prefill_kernels(self, mixed_qkv: torch.Tensor) -> None:
