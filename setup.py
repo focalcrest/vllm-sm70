@@ -308,14 +308,36 @@ class cmake_build_ext(build_ext):
 
         num_jobs, _ = self.compute_num_jobs()
 
-        build_args = [
-            "--build",
-            ".",
-            f"-j={num_jobs}",
-            *[f"--target={name}" for name in targets],
-        ]
+        # Split required and optional targets. Optional targets may not exist
+        # on all platforms (e.g. FA3, FlashMLA on SM70).
+        required_targets = []
+        optional_targets = []
+        for ext in self.extensions:
+            t = target_name(ext.name)
+            if getattr(ext, "optional", False):
+                optional_targets.append(t)
+            else:
+                required_targets.append(t)
 
-        subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
+        # Build required targets as one batch
+        if required_targets:
+            build_args = [
+                "--build",
+                ".",
+                f"-j={num_jobs}",
+                *[f"--target={name}" for name in required_targets],
+            ]
+            subprocess.check_call(["cmake", *build_args], cwd=self.build_temp)
+
+        # Build optional targets individually, skipping failures
+        for t in optional_targets:
+            try:
+                subprocess.check_call(
+                    ["cmake", "--build", ".", f"-j={num_jobs}", f"--target={t}"],
+                    cwd=self.build_temp,
+                )
+            except subprocess.CalledProcessError:
+                print(f"Skipping optional target: {t}")
 
         # Install the libraries
         for ext in self.extensions:
@@ -342,7 +364,14 @@ class cmake_build_ext(build_ext):
                 "--component",
                 target_name(ext.name),
             ]
-            subprocess.check_call(install_args, cwd=self.build_temp)
+            try:
+                subprocess.check_call(install_args, cwd=self.build_temp)
+            except subprocess.CalledProcessError:
+                if getattr(ext, "optional", False):
+                    print(f"Skipping install for optional target: "
+                          f"{target_name(ext.name)}")
+                else:
+                    raise
 
     def run(self):
         # First, run the standard build_ext command to compile the extensions
@@ -998,12 +1027,18 @@ if _is_hip():
     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))
 
 if _is_cuda():
-    ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    ext_modules.append(
+        CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C", optional=True)
+    )
     if envs.VLLM_USE_PRECOMPILED or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
     ):
-        # FA3 requires CUDA 12.3 or later
-        ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
+        # FA3 requires CUDA 12.3+ and SM80+ (not available on SM70)
+        ext_modules.append(
+            CMakeExtension(
+                name="vllm.vllm_flash_attn._vllm_fa3_C", optional=True
+            )
+        )
     # FA4 CuteDSL - Python-only component for FA4's cute DSL support
     # Optional since this doesn't produce a .so file, just copies Python files
     ext_modules.append(
