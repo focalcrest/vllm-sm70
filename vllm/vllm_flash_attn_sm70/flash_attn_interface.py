@@ -10,7 +10,7 @@ import torch.nn as nn
 # We need to import the CUDA kernels after importing torch
 # Use relative import to support build-from-source installation in vLLM
 
-from . import _vllm_fa2_sm70_C  # noqa: F401
+from vllm.vllm_flash_attn import _vllm_fa2_C  # noqa: F401
 
 # isort: on
 
@@ -241,7 +241,7 @@ def flash_attn_varlen_func(
         # Allow split-KV for prefill when env var is set
         if num_splits <= 1 and max_seqlen_q > 1:
             num_splits = _prefill_num_splits(max_seqlen_k, q.shape[1])
-        out, softmax_lse = torch.ops._vllm_fa2_sm70_C.varlen_fwd(
+        out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
             q, k, v,
             out,
             cu_seqlens_q,
@@ -322,7 +322,7 @@ def flash_attn_decode_paged(
 ):
     """Paged decode wrapper for SM70 FlashAttention.
 
-    This is a direct wrapper over the native _vllm_fa2_sm70_C.fwd_kvcache op.
+    This is a direct wrapper over the native _vllm_fa2_C.fwd_kvcache op.
     It expects the current vLLM paged KV cache layout and block table directly,
     without materializing a contiguous intermediate buffer.
     """
@@ -358,7 +358,7 @@ def flash_attn_decode_paged(
                 f"got {tuple(out.shape)}"
             )
 
-    out_tensors = torch.ops._vllm_fa2_sm70_C.fwd_kvcache(
+    out_tensors = torch.ops._vllm_fa2_C.fwd_kvcache(
         q,
         k_cache,
         v_cache,
@@ -445,7 +445,7 @@ def flash_attn_prefill_paged(
                 f"or [1, q_len, num_heads, head_dim]; got {tuple(out.shape)}"
             )
 
-    out_tensors = torch.ops._vllm_fa2_sm70_C.fwd_kvcache(
+    out_tensors = torch.ops._vllm_fa2_C.fwd_kvcache(
         q,
         kv_cache,
         kv_cache,  # v_cache same as k_cache (TQ unified)
