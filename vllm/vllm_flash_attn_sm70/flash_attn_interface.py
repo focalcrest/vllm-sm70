@@ -53,15 +53,24 @@ def _maybe_int32_contiguous(x):
 
 
 def _decode_num_splits() -> int:
+    """Return num_splits override for FA decode-path on SM70.
+
+    Default 4 picked from a sweep on Qwen3.6-27B-W8A16 V100 TP=8
+    cudagraph (worklog 2026-05-09-fa-num-splits-tuning.md): values 2/4
+    give +2.7% over FA's internal auto, 4 is best, 8/16/32 fall off
+    slightly. Override with VLLM_SM70_FLASH_ATTN_DECODE_NUM_SPLITS or
+    SM70_FLASH_ATTN_DECODE_NUM_SPLITS to test alternative settings.
+    Set to 0 to fall back to FA's heuristic.
+    """
     raw = os.environ.get("SM70_FLASH_ATTN_DECODE_NUM_SPLITS")
     if raw is None:
         raw = os.environ.get("VLLM_SM70_FLASH_ATTN_DECODE_NUM_SPLITS")
     if raw is None:
-        return 0
+        return 4
     try:
         return max(0, int(raw))
     except ValueError:
-        return 0
+        return 4
 
 
 def _prefill_num_splits(max_seqlen_k: int, num_heads: int) -> int:
