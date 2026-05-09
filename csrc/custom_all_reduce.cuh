@@ -368,7 +368,8 @@ __global__ void __launch_bounds__(512, 1)
 template <typename T, int kGroupSize>
 __global__ void __launch_bounds__(512, 1)
 cross_device_reduce_hierarchical(
-    RankData* _dp, RankSignals group_sg, Signal* __restrict__ self_sg,
+    RankData* _dp, int group_start,
+    RankSignals group_sg, Signal* __restrict__ self_sg,
     T* __restrict__ result, int local_rank, int size,
     RankSignals cross_sg, int cross_rank,
     const void* __restrict__ partner_tmp_ptr) {
@@ -379,11 +380,17 @@ cross_device_reduce_hierarchical(
   auto partner_tmp = reinterpret_cast<const P*>(partner_tmp_ptr);
 
   // Phase 1: Intra-group 1-stage reduce → self_tmp
+  // group_start lets the same kernel consume both layouts:
+  //   eager mode: _dp is d_group_rank_data_ where ptrs[0..kGroupSize)
+  //               are the group peers (group_start = 0).
+  //   capture mode: _dp is the graph-aware per-call RankData with
+  //               ptrs[0..world_size_) = all 8 peers; the group's slice
+  //               starts at group_start = group_id * kGroupSize.
   barrier_at_start<kGroupSize>(group_sg, self_sg, local_rank);
   for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < size;
        idx += gridDim.x * blockDim.x) {
     self_tmp[idx] = packed_reduce<P, kGroupSize, A>(
-        (const P**)&dp.ptrs[0], idx);
+        (const P**)&dp.ptrs[group_start], idx);
   }
   // Combined Phase 1 end + Phase 2 start barrier.
   // Merges release/acquire group sync and volatile partner sync into
@@ -667,19 +674,29 @@ class CustomAllreduce {
     auto bytes = size * sizeof(typename packed_t<T>::P);
     int blocks = std::min(block_limit, (size + threads - 1) / threads);
 
-    // Hierarchical mode is not cudagraph-compatible: it uses
-    // d_group_rank_data_ which is never updated with graph buffer
-    // addresses. Fall through to the flat path during capture.
-    if (hierarchical_mode_ && status != cudaStreamCaptureStatusActive) {
+    // Hierarchical mode in both eager and cudagraph capture:
+    //   - Eager: pass d_group_rank_data_ (group peers at ptrs[0..kGroupSize))
+    //     with group_start=0.
+    //   - Capture: pass the graph-aware per-call ptrs (all 8 peers) with
+    //     group_start=group_id_*kGroupSize so the kernel reads the right
+    //     slice. Previously the capture path fell through to the flat
+    //     REDUCE_CASE which has no `else` for !fully_connected, so no
+    //     kernel was launched and the captured graph reduced from
+    //     uninitialised memory ("!!!!" garbage at decode).
+    if (hierarchical_mode_) {
       using P = typename packed_t<T>::P;
       auto* partner_tmp = reinterpret_cast<P*>(
           reinterpret_cast<char*>(partner_signal_) + sizeof(Signal));
+      RankData* hier_dp =
+          (status == cudaStreamCaptureStatusActive) ? ptrs : d_group_rank_data_;
+      int hier_group_start =
+          (status == cudaStreamCaptureStatusActive) ? group_id_ * 4 : 0;
       // Cap at 18 blocks so Phase 2 slots (18+blockIdx.x) stay within
       // kMaxBlocks=36
       int hier_blocks = std::min(blocks, 18);
       cross_device_reduce_hierarchical<T, 4>
           <<<hier_blocks, threads, 0, stream>>>(
-              d_group_rank_data_, group_sg_, self_sg_,
+              hier_dp, hier_group_start, group_sg_, self_sg_,
               reinterpret_cast<T*>(output), local_rank_,
               size, cross_sg_, group_id_, partner_tmp);
       return;
