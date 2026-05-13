@@ -534,6 +534,13 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
+
+        # Map reasoning_effort to thinking_token_budget if not explicitly set
+        _thinking_budget = self.thinking_token_budget
+        if _thinking_budget is None and self.reasoning_effort is not None:
+            _effort_to_budget = {"low": 512, "medium": 2048, "high": None}
+            _thinking_budget = _effort_to_budget.get(self.reasoning_effort)
+
         return SamplingParams.from_optional(
             n=self.n,
             presence_penalty=self.presence_penalty,
@@ -560,7 +567,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             structured_outputs=self.structured_outputs,
             logit_bias=self.logit_bias,
             bad_words=self.bad_words,
-            thinking_token_budget=self.thinking_token_budget,
+            thinking_token_budget=_thinking_budget,
             allowed_token_ids=self.allowed_token_ids,
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
