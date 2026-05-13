@@ -159,6 +159,14 @@ class TurboQuantAttentionBackend(AttentionBackend):
         return kv_cache_dtype.startswith("turboquant_")
 
     @classmethod
+    def get_kv_cache_stride_order(
+        cls,
+        include_num_layers_dimension: bool = False,
+        cache_dtype_str: str = "auto",
+    ) -> tuple[int, ...]:
+        return (0, 1, 2, 3)
+
+    @classmethod
     def supports_head_size(cls, head_size: int) -> bool:
         # head_size from spec is effective_head_size (padded_slot//2),
         # not the model's actual head_dim. Accept any positive value.
