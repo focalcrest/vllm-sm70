@@ -176,9 +176,21 @@ class SimpleCPUOffloadWorker:
         if use_mmap:
             os.makedirs(cpu_pool_path, exist_ok=True)
             rank = self.device.index if self.device is not None else 0
+            # SM70 fork (Phase E.2a): include engine_id in mmap path so DP=2
+            # co-tenancy doesn't have two engines clobbering each other's
+            # files. UUID4 prefix is unique enough; use first 8 hex chars
+            # to keep filenames readable.
+            eng_id_full = (
+                kv_xfer_cfg.engine_id
+                if (kv_xfer_cfg and kv_xfer_cfg.engine_id)
+                else "unknown"
+            )
+            eng_id_short = eng_id_full.replace("-", "")[:8]
+            self._mmap_eng_id_short = eng_id_short
             logger.info(
-                "SimpleCPUOffloadWorker: mmap CPU pool at %s (rank=%d, no pinning)",
-                cpu_pool_path, rank,
+                "SimpleCPUOffloadWorker: mmap CPU pool at %s "
+                "(engine=%s rank=%d, no pinning)",
+                cpu_pool_path, eng_id_short, rank,
             )
         elif not pin_memory:
             logger.warning(
@@ -190,11 +202,12 @@ class SimpleCPUOffloadWorker:
         for name, gpu_tensor in unique_gpu_caches.items():
             cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
             if use_mmap:
-                # Per-rank, per-tensor file. Sanitize tensor name for filename.
+                # Per-engine, per-rank, per-tensor file. Sanitize tensor name.
                 safe_name = name.replace("/", "_").replace(".", "_")
                 rank = self.device.index if self.device is not None else 0
                 file_path = os.path.join(
-                    cpu_pool_path, f"r{rank}_{safe_name}.bin"
+                    cpu_pool_path,
+                    f"eng{self._mmap_eng_id_short}_r{rank}_{safe_name}.bin",
                 )
                 total_bytes = (
                     int(np.prod(cpu_shape)) * gpu_tensor.element_size()
