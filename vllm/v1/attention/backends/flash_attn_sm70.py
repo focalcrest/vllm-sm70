@@ -10,6 +10,8 @@ This backend keeps the strict fallback behavior from the 1cat prototype:
 
 from __future__ import annotations
 
+import os
+
 import torch
 from typing import ClassVar
 
@@ -508,7 +510,7 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
             _logged_decode_flash = True
         try:
             return self._flash_v100_decode(
-                query, key, value, kv_cache, attn_metadata, output
+                query, key, value, kv_cache, attn_metadata, output, layer
             )
         except (RuntimeError, ValueError, IndexError) as e:
             logger.warning(
@@ -735,6 +737,7 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         kv_cache: torch.Tensor,
         attn_metadata: TritonAttentionMetadata,
         output: torch.Tensor,
+        layer: torch.nn.Module | None = None,
     ) -> torch.Tensor:
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
@@ -743,11 +746,46 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         if query.shape[0] == 0:
             return output
 
+        # TQ decode: two paths selectable via VLLM_TQ_TRITON_DECODE env var
+        #   "1" (default) = Triton FP32 decode (better quality, ~1078 think tokens)
+        #   "0" = FA2 HMMA decode (FP16 arithmetic, ~1150 think tokens)
         if self._is_tq_cache():
-            # TQ: single combined uint8 cache [num_blocks, page_block_size, num_heads_k, slot_size]
-            # Both k_cache and v_cache point to the same slot data
-            key_cache = kv_cache
-            value_cache = kv_cache
+            use_triton = os.environ.get("VLLM_TQ_TRITON_DECODE", "1") == "1"
+            if use_triton:
+                from vllm.v1.attention.ops.triton_turboquant_decode import (
+                    triton_turboquant_decode_attention,
+                )
+                assert layer is not None
+                self._ensure_tq_on_device(layer, query.device)
+                N = num_actual_tokens
+                q = query.view(N, self.num_heads, self.head_size)
+                result = triton_turboquant_decode_attention(
+                    query=q,
+                    kv_cache=kv_cache,
+                    block_table=attn_metadata.block_table,
+                    seq_lens=attn_metadata.seq_lens,
+                    Pi=layer._tq_PiT,
+                    centroids=layer._tq_centroids,
+                    scale=self.scale,
+                    mse_bits=self._tq_config.key_mse_bits,
+                    key_packed_size=self._tq_config.key_packed_size,
+                    value_quant_bits=self._tq_config.effective_value_quant_bits,
+                    key_fp8=self._tq_config.key_fp8,
+                    norm_correction=self._tq_config.norm_correction,
+                    PiT=layer._tq_PiT,
+                    mid_o_buf=getattr(layer, "_tq_mid_o_buf", None),
+                    output_buf=getattr(layer, "_tq_output_buf", None),
+                    lse_buf=getattr(layer, "_tq_lse_buf", None),
+                    buf_holder=layer,
+                    max_num_kv_splits=32,
+                )
+                out_view.view(N, -1).copy_(
+                    result.reshape(N, -1).to(out_view.dtype)
+                )
+                return output
+            else:
+                key_cache = kv_cache
+                value_cache = kv_cache
         elif kv_cache.shape[0] == 2:
             key_cache, value_cache = kv_cache.unbind(0)
         else:
