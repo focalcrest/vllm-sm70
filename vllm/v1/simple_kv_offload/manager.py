@@ -17,6 +17,7 @@ from vllm.v1.core.kv_cache_coordinator import (
     KVCacheCoordinator,
     get_kv_cache_coordinator,
 )
+from vllm.v1.core.kv_cache_utils import get_block_hash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -36,6 +37,65 @@ if TYPE_CHECKING:
     from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+
+
+class MarconiAdmissionTracker:
+    """SM70 fork (Phase E.3a): Marconi-style admission filter.
+
+    Tracks how often each block_hash has been observed across requests.
+    `should_admit(bhash)` returns True only if the hash has been seen at
+    least `threshold` times — i.e. we predict the prefix will be reused.
+
+    Default threshold=1 reproduces the upstream behavior ("admit
+    everything"). Set via kv_connector_extra_config["admission_threshold"]
+    (e.g. 2: only cache prefixes that have appeared twice).
+
+    The hash_count dict is GC'd when it exceeds max_size: drops all
+    singletons (seen exactly once), keeping the "hot" working set.
+    """
+
+    def __init__(self, threshold: int = 1, max_size: int = 100_000):
+        self.threshold: int = max(1, int(threshold))
+        self.max_size: int = max_size
+        self.hash_count: dict[bytes, int] = {}
+        # Cheap stats for worklog/benchmarking.
+        self.admitted: int = 0
+        self.rejected: int = 0
+        self.observed: int = 0
+
+    def observe(self, bhash: bytes) -> None:
+        if bhash is None:
+            return
+        self.observed += 1
+        self.hash_count[bhash] = self.hash_count.get(bhash, 0) + 1
+        if len(self.hash_count) > self.max_size:
+            # GC: drop singletons to bound memory; preserves "hot" set.
+            self.hash_count = {
+                h: c for h, c in self.hash_count.items() if c >= 2
+            }
+
+    def should_admit(self, bhash: bytes) -> bool:
+        if self.threshold <= 1:
+            self.admitted += 1
+            return True
+        admit = self.hash_count.get(bhash, 0) >= self.threshold
+        if admit:
+            self.admitted += 1
+        else:
+            self.rejected += 1
+        return admit
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "threshold": self.threshold,
+            "observed": self.observed,
+            "admitted": self.admitted,
+            "rejected": self.rejected,
+            "tracked_hashes": len(self.hash_count),
+            "hot_hashes": sum(
+                1 for c in self.hash_count.values() if c >= self.threshold
+            ),
+        }
 
 
 @dataclass
@@ -153,6 +213,26 @@ class SimpleCPUOffloadScheduler:
         self._expected_worker_count = vllm_config.parallel_config.world_size
         self._store_event_pending_counts: dict[int, int] = {}
 
+        # SM70 fork (Phase E.3a): Marconi-style admission tracker.
+        # extra_config["admission_threshold"]=N requires a block_hash to have
+        # been observed >=N times before it gets stored to CPU pool.
+        kv_xfer_cfg = vllm_config.kv_transfer_config
+        extra_cfg = (
+            kv_xfer_cfg.kv_connector_extra_config
+            if kv_xfer_cfg is not None
+            else {}
+        ) or {}
+        admission_threshold = int(extra_cfg.get("admission_threshold", 1))
+        self._admission_tracker = MarconiAdmissionTracker(
+            threshold=admission_threshold,
+        )
+        if admission_threshold > 1:
+            logger.info(
+                "SimpleCPUOffloadScheduler: Marconi admission enabled, "
+                "threshold=%d",
+                admission_threshold,
+            )
+
     @staticmethod
     def _derive_cpu_config(
         gpu_config: "KVCacheConfig", cpu_capacity_bytes: int
@@ -211,6 +291,13 @@ class SimpleCPUOffloadScheduler:
         """Return (num_new_tokens, is_async) from consecutive CPU cache hits."""
         skipped = num_computed_tokens // self.block_size
         remaining_hashes = request.block_hashes[skipped:]
+
+        # SM70 fork (Phase E.3a): Marconi admission observation. Every block
+        # the scheduler asks about gets counted; the admission gate in
+        # _prepare_eager_store_specs uses these counts to decide whether
+        # a block is "hot enough" to deserve a CPU pool slot.
+        for bh in remaining_hashes:
+            self._admission_tracker.observe(bh)
 
         if not remaining_hashes:
             return 0, False
@@ -453,6 +540,10 @@ class SimpleCPUOffloadScheduler:
         Returns:
             (gpu_block_ids, cpu_block_ids, req_ids) for the store event.
         """
+        # SM70 fork (Phase E.3a): snapshot before-counters so we can log
+        # tracker stats only when this call actually did something.
+        _admit_before = self._admission_tracker.admitted
+        _reject_before = self._admission_tracker.rejected
 
         merged_gpu_block_ids: list[int] = []
         merged_cpu_block_ids: list[int] = []
@@ -532,6 +623,20 @@ class SimpleCPUOffloadScheduler:
                         advanced_per_group[g] += 1
                         continue
 
+                    # SM70 fork (Phase E.3a): Marconi admission gate. Skip
+                    # storing prefixes the admission tracker considers
+                    # unlikely to be reused. The block continues to live in
+                    # GPU; if the same hash reappears in future requests,
+                    # observe() bumps its count and a later iteration will
+                    # admit it.
+                    # bhash_with_group bundles a group_id; observe() in
+                    # get_num_new_matched_tokens uses raw BlockHash. Strip
+                    # so both code paths key the tracker identically.
+                    raw_bhash = get_block_hash(bhash_with_group)
+                    if not self._admission_tracker.should_admit(raw_bhash):
+                        advanced_per_group[g] += 1
+                        continue
+
                     if num_free <= 0:
                         out_of_space = True
                         break
@@ -575,6 +680,19 @@ class SimpleCPUOffloadScheduler:
             # Advance per-group cursors (includes cached hits + newly stored)
             for g in range(num_groups):
                 state.num_stored_blocks[g] += advanced_per_group[g]
+
+        # SM70 fork (Phase E.3a): log tracker stats when Marconi is
+        # enabled and this call admitted or rejected at least one block.
+        # Default (threshold=1) path stays quiet.
+        if self._admission_tracker.threshold > 1:
+            admit_delta = self._admission_tracker.admitted - _admit_before
+            reject_delta = self._admission_tracker.rejected - _reject_before
+            if admit_delta > 0 or reject_delta > 0:
+                logger.info(
+                    "Marconi tracker: +admit=%d +reject=%d cumulative=%s",
+                    admit_delta, reject_delta,
+                    self._admission_tracker.stats(),
+                )
 
         return merged_gpu_block_ids, merged_cpu_block_ids, req_ids
 
