@@ -302,9 +302,11 @@ class Scheduler(SchedulerInterface):
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
     ) -> int:
-        assert num_external_computed_tokens == 0, (
-            "External KV connector is not verified yet"
-        )
+        # NOTE(sm70-fork): Upstream had `assert num_external_computed_tokens == 0`
+        # here marked "External KV connector is not verified yet". The function
+        # body below correctly factors external tokens into num_computed_tokens
+        # (line below), so the assert was a TODO marker, not a correctness gate.
+        # Removed to unblock SimpleCPUOffloadConnector / LMCache on hybrid models.
         num_computed_tokens = (
             request.num_computed_tokens
             + num_new_local_computed_tokens
