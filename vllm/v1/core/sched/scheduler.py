@@ -708,7 +708,14 @@ class Scheduler(SchedulerInterface):
                             # The request cannot be scheduled.
                             break
 
-                if self.need_mamba_block_aligned_split:
+                # NOTE(sm70-fork): When load_kv_async is True, num_new_tokens is
+                # deliberately 0 (see line ~669) because the request is waiting
+                # for an external KV transfer. Running _mamba_block_aligned_split
+                # on 0 returns 0, then the `break` below skips line ~800 where
+                # status is set to WAITING_FOR_REMOTE_KVS - leaving the request
+                # in WAITING and causing infinite re-scheduling on subsequent
+                # steps. Skip the mamba alignment in that case.
+                if self.need_mamba_block_aligned_split and not load_kv_async:
                     num_new_tokens = self._mamba_block_aligned_split(
                         request,
                         num_new_tokens,
