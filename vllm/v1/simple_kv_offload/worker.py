@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
+import mmap
+import os
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from vllm.config import VllmConfig
@@ -62,6 +65,12 @@ class SimpleCPUOffloadWorker:
         self._pending_store_event_indices: set[int] = set()
         # Completed store events to report via build_connector_worker_meta
         self._completed_store_events: dict[int, int] = {}
+
+        # SM70 fork (Phase E.1): if cpu_pool_path is configured, CPU pool
+        # tensors are backed by mmap'd files (NVMe for SSD spillover, or
+        # /dev/shm for cross-process DP sharing in Phase E.2). Hold the mmap
+        # handles here so the GC doesn't unmap them while the worker is live.
+        self._mmap_handles: list[mmap.mmap] = []
 
     def register_kv_caches(
         self,
@@ -149,8 +158,29 @@ class SimpleCPUOffloadWorker:
             (self.num_cpu_blocks * total_bytes_per_block) / (1024**3),
         )
 
+        # SM70 fork (Phase E.1): mmap-backed CPU pool for SSD spillover.
+        # Set kv_connector_extra_config = {"cpu_pool_path": "/mnt/nvme/vllm_kv"}
+        # or "/dev/shm/vllm_kv" to back the CPU tensors with mmap'd files.
+        # When unset, falls back to torch.zeros pinned-memory allocation
+        # (the upstream default).
+        kv_xfer_cfg = self.vllm_config.kv_transfer_config
+        extra_cfg = (
+            kv_xfer_cfg.kv_connector_extra_config
+            if kv_xfer_cfg is not None
+            else {}
+        ) or {}
+        cpu_pool_path = extra_cfg.get("cpu_pool_path")
+
         pin_memory = is_pin_memory_available()
-        if not pin_memory:
+        use_mmap = bool(cpu_pool_path)
+        if use_mmap:
+            os.makedirs(cpu_pool_path, exist_ok=True)
+            rank = self.device.index if self.device is not None else 0
+            logger.info(
+                "SimpleCPUOffloadWorker: mmap CPU pool at %s (rank=%d, no pinning)",
+                cpu_pool_path, rank,
+            )
+        elif not pin_memory:
             logger.warning(
                 "Pinned memory not available. CPU offload performance may be degraded."
             )
@@ -159,12 +189,61 @@ class SimpleCPUOffloadWorker:
         self.cpu_kv_caches = {}
         for name, gpu_tensor in unique_gpu_caches.items():
             cpu_shape = (self.num_cpu_blocks,) + gpu_tensor.shape[1:]
-            # Allocate non-pinned first, then pin via cudaHostRegister to
-            # bypass PyTorch's CUDACachingHostAllocator which rounds up to
-            # the next power of 2 (e.g. 100 GB -> 128 GB).
-            tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
-            if pin_memory:
-                pin_tensor(tensor)
+            if use_mmap:
+                # Per-rank, per-tensor file. Sanitize tensor name for filename.
+                safe_name = name.replace("/", "_").replace(".", "_")
+                rank = self.device.index if self.device is not None else 0
+                file_path = os.path.join(
+                    cpu_pool_path, f"r{rank}_{safe_name}.bin"
+                )
+                total_bytes = (
+                    int(np.prod(cpu_shape)) * gpu_tensor.element_size()
+                )
+                fd = os.open(
+                    file_path, os.O_RDWR | os.O_CREAT, 0o600
+                )
+                try:
+                    os.ftruncate(fd, total_bytes)
+                    mm = mmap.mmap(
+                        fd, total_bytes, mmap.MAP_SHARED,
+                        mmap.PROT_READ | mmap.PROT_WRITE,
+                    )
+                finally:
+                    os.close(fd)
+                self._mmap_handles.append(mm)
+                # Wrap as a torch tensor sharing the mmap buffer. numpy
+                # itemsize must match torch dtype itemsize.
+                np_dtype_str = {
+                    torch.float16: "f2",
+                    torch.bfloat16: "f2",  # 2 bytes; torch->numpy via uint16
+                    torch.float32: "f4",
+                    torch.uint8: "u1",
+                    torch.int8: "i1",
+                    torch.int32: "i4",
+                    torch.int64: "i8",
+                }.get(gpu_tensor.dtype)
+                if np_dtype_str is None:
+                    raise NotImplementedError(
+                        f"mmap CPU pool: unsupported dtype {gpu_tensor.dtype}"
+                    )
+                if gpu_tensor.dtype == torch.bfloat16:
+                    # numpy has no native bfloat16. View raw bytes then
+                    # let torch reinterpret to bfloat16.
+                    arr = np.frombuffer(mm, dtype=np.uint16).reshape(cpu_shape)
+                    tensor = torch.from_numpy(arr).view(torch.bfloat16)
+                else:
+                    arr = np.frombuffer(mm, dtype=np_dtype_str).reshape(cpu_shape)
+                    tensor = torch.from_numpy(arr)
+                # File-backed mmap cannot be cudaHostRegister'd without
+                # extra care; skip pinning for the MVP. DMA backend still
+                # works against unpinned host memory.
+            else:
+                # Allocate non-pinned first, then pin via cudaHostRegister to
+                # bypass PyTorch's CUDACachingHostAllocator which rounds up to
+                # the next power of 2 (e.g. 100 GB -> 128 GB).
+                tensor = torch.zeros(cpu_shape, dtype=gpu_tensor.dtype, device="cpu")
+                if pin_memory:
+                    pin_tensor(tensor)
             self.cpu_kv_caches[name] = tensor
 
         # Use lowest priority so KV cache I/O yields to compute streams.
