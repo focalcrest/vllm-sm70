@@ -442,6 +442,14 @@ class SimpleCPUOffloadScheduler:
         self._tok_l1_hits: int = 0
         self._tok_l2_hits: int = 0
 
+        # SM70 fork (Phase E.5b): demote/promote pair accumulators. These
+        # are populated by _prepare_eager_store_specs (demote) and
+        # update_state_after_alloc (promote), then drained by
+        # build_connector_meta into SimpleCPUOffloadMetadata so the worker
+        # can execute the corresponding CPU memcpys before any DMA.
+        self._pending_demote_pairs: list[tuple[int, int]] = []
+        self._pending_promote_pairs: list[tuple[int, int]] = []
+
         eviction_policy_name = str(
             extra_cfg.get("eviction_policy", "lru")
         ).lower()
@@ -713,6 +721,14 @@ class SimpleCPUOffloadScheduler:
                 self._reqs_to_load[req_id].load_event = load_event
             self._load_event_to_reqs[load_event] = load_req_ids
 
+        # SM70 fork (Phase E.5b): drain accumulated inter-tier moves into
+        # the worker metadata so the worker performs the CPU memcpys at
+        # the start of get_finished, before any DMA dispatch.
+        demote_pairs = self._pending_demote_pairs
+        promote_pairs = self._pending_promote_pairs
+        self._pending_demote_pairs = []
+        self._pending_promote_pairs = []
+
         result = SimpleCPUOffloadMetadata(
             load_event=load_event,
             load_gpu_blocks=load_gpu,
@@ -721,6 +737,8 @@ class SimpleCPUOffloadScheduler:
             store_event=store_event,
             store_gpu_blocks=store_gpu,
             store_cpu_blocks=store_cpu,
+            demote_pairs=demote_pairs,
+            promote_pairs=promote_pairs,
             need_flush=bool(scheduler_output.preempted_req_ids),
         )
         return result
@@ -872,6 +890,105 @@ class SimpleCPUOffloadScheduler:
         policy.hoisted += len(victims)
         policy.evictions += len(victims)
 
+    def _demote_l1_victims_for_admission(
+        self, n_needed: int
+    ) -> list[tuple[int, int]]:
+        """SM70 fork (Phase E.5b): before admitting n_needed new blocks
+        to L1, identify which currently-cached L1 blocks would be evicted
+        (they sit at the head of L1's free queue after the hoist) and
+        demote them to L2 instead of dropping their hashes.
+
+        Side-effects on the caller's behalf:
+          - Allocates L2 slots (may itself evict L2 victims by score).
+          - Moves the hash entry from L1's cache map to L2's cache map.
+          - Resets the L1 block's hash so subsequent get_new_blocks()
+            sees it as a clean slot.
+          - Transfers Marconi metadata from (l1, vid) to (l2, dst).
+          - Calls free_blocks on the freshly-stamped L2 block so it
+            re-enters L2's free queue as cached-and-free, eligible for
+            future hits.
+
+        Returns the list of (l1_block_id, l2_block_id) demote pairs so
+        the caller can emit them to the worker for memcpy.
+        """
+        if (
+            not self._dual_tier
+            or self.l2_block_pool is None
+            or n_needed <= 0
+        ):
+            return []
+
+        # Walk L1's free queue head, pick cached blocks that would be the
+        # next get_new_blocks() victims. _hoist_victims_to_head has
+        # already reordered the queue so head==Marconi worst.
+        fq = self.cpu_block_pool.free_block_queue
+        fake_tail = fq.fake_free_list_tail
+        node = fq.fake_free_list_head.next_free_block
+        victims: list = []  # KVCacheBlock objects
+        walked = 0
+        while (
+            node is not None
+            and node is not fake_tail
+            and walked < n_needed
+            and len(victims) < n_needed
+        ):
+            if node.block_hash is not None:
+                victims.append(node)
+            walked += 1
+            node = node.next_free_block
+
+        if not victims:
+            return []
+
+        # Make room in L2 via its own Marconi-hoisted eviction. If L2 is
+        # tight, hoist worst L2 blocks to head; get_new_blocks drops them.
+        self._hoist_victims_to_head(
+            len(victims),
+            tier="l2",
+            block_pool=self.l2_block_pool,
+        )
+        # If L2 free queue can't satisfy len(victims), demote as many as
+        # fit. The overflow falls back to the normal L1 drop path.
+        l2_free = self.l2_block_pool.get_num_free_blocks()
+        if l2_free < len(victims):
+            victims = victims[:l2_free]
+            if not victims:
+                return []
+
+        l2_blocks = self.l2_block_pool.get_new_blocks(len(victims))
+        pairs: list[tuple[int, int]] = []
+        policy = self._eviction_policy
+        for l1_blk, l2_blk in zip(victims, l2_blocks):
+            bhash = l1_blk.block_hash
+            if bhash is None:
+                # Race / unexpected: skip cleanly.
+                self.l2_block_pool.free_blocks([l2_blk])
+                continue
+            # Stamp hash onto L2, register in L2 cache map.
+            l2_blk._block_hash = bhash  # type: ignore[assignment]
+            self.l2_block_pool.cached_block_hash_to_block.insert(
+                bhash, l2_blk
+            )
+            # Remove hash from L1 cache map and clear L1 block's hash so
+            # the next get_new_blocks() sees it as a clean slot (the
+            # subsequent _maybe_evict_cached_block call is a no-op).
+            self.cpu_block_pool.cached_block_hash_to_block.pop(
+                bhash, l1_blk.block_id
+            )
+            l1_blk.reset_hash()
+            # Transfer Marconi metadata from L1 namespace to L2.
+            if policy is not None:
+                policy.transfer_tier(
+                    "l1", l1_blk.block_id, "l2", l2_blk.block_id
+                )
+                policy.demotes += 1
+            pairs.append((l1_blk.block_id, l2_blk.block_id))
+            # Drop L2 ref_cnt back to 0 so the block re-enters its free
+            # queue at the tail, ready to be returned by find_longest
+            # for future L2 hits.
+            self.l2_block_pool.free_blocks([l2_blk])
+        return pairs
+
     def _prepare_eager_store_specs(
         self, scheduler_output: SchedulerOutput
     ) -> tuple[list[int], list[int], list[str]]:
@@ -1016,6 +1133,14 @@ class SimpleCPUOffloadScheduler:
                 # head of the free queue so they're popped first by
                 # get_new_blocks (replaces pure LRU with FLOP-aware order).
                 self._hoist_victims_to_head(n_to_alloc)
+                # SM70 fork (Phase E.5b-1): in dual-tier mode, before
+                # get_new_blocks() drops the cached blocks at the L1
+                # queue head, demote them to L2. The pairs are accumulated
+                # for the worker to memcpy in the next step boundary.
+                if self._dual_tier:
+                    demoted = self._demote_l1_victims_for_admission(n_to_alloc)
+                    if demoted:
+                        self._pending_demote_pairs.extend(demoted)
                 cpu_blocks_alloc = cpu_block_pool.get_new_blocks(n_to_alloc)
                 cpu_block_ids = [blk.block_id for blk in cpu_blocks_alloc]
                 for cpu_blk, bhash in zip(cpu_blocks_alloc, block_hashes_to_store):
