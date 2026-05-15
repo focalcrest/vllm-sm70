@@ -404,7 +404,14 @@ class SimpleCPUOffloadScheduler:
         # BlockPool/Coordinator for the L2 tier and run a tier-aware
         # admit/promote/demote orchestration on top of the existing
         # single-tier code paths.
-        l2_capacity_bytes = int(extra_cfg.get("l2_bytes_to_use", 0) or 0)
+        # `l2_bytes_to_use` is server-wide (matches the L1 convention where
+        # the connector pre-divides cpu_bytes_to_use). Divide here so the
+        # per-rank num_l2_blocks computed by _derive_cpu_config matches what
+        # the worker physically allocates.
+        l2_bytes_total = int(extra_cfg.get("l2_bytes_to_use", 0) or 0)
+        l2_capacity_bytes = l2_bytes_total // max(
+            1, vllm_config.parallel_config.world_size
+        )
         l2_pool_path_present = bool(extra_cfg.get("l2_pool_path"))
         self._dual_tier: bool = l2_capacity_bytes > 0 and l2_pool_path_present
         self.l2_kv_cache_config: KVCacheConfig | None = None
