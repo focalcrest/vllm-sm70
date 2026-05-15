@@ -187,7 +187,12 @@ class SimpleCPUOffloadWorker:
         # the manager must promote L2 blocks back to L1 before scheduling
         # any GPU transfer.
         l2_pool_path = extra_cfg.get("l2_pool_path")
-        l2_bytes_to_use = int(extra_cfg.get("l2_bytes_to_use", 0) or 0)
+        # Match the L1 convention: `l2_bytes_to_use` is server-wide; the
+        # connector hands the worker a per-rank slice. Each rank only owns
+        # a 1/world_size share of total physical L2.
+        world_size = self.vllm_config.parallel_config.world_size
+        l2_bytes_total = int(extra_cfg.get("l2_bytes_to_use", 0) or 0)
+        l2_bytes_to_use = l2_bytes_total // max(1, world_size)
 
         pin_memory = is_pin_memory_available()
 
