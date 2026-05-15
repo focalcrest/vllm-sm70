@@ -100,44 +100,58 @@ class MarconiAdmissionTracker:
 
 
 class MarconiEvictionPolicy:
-    """SM70 fork (Phase E.3b): FLOP-aware eviction policy.
+    """SM70 fork (Phase E.3b): reuse-aware "gateway" eviction policy.
 
-    Pairs with [[MarconiAdmissionTracker]] to complete the Marconi
-    algorithm from "Prefix Caching for the Era of Hybrid LLMs" (NSDI'25).
+    Pairs with [[MarconiAdmissionTracker]]. Marconi (NSDI'25) was designed
+    for hybrid layouts where deep blocks store the most compute. vLLM
+    prefix caching is strictly left-to-right: a depth-d block is useless
+    without depths 0..d-1, so evicting any shallow block of a hot prefix
+    kills the whole chain. That makes the textbook FLOP-aware scoring
+    actively harmful — our Zipfian eval showed it lost LRU by ~115 ms
+    mean. We invert the depth term to prefer keeping *gateway* blocks of
+    hot prefixes:
 
-    Each cached CPU block is scored by:
+        score = reuse_count(bhash) * exp(-decay_rate * age) / (depth + 1)
 
-        score = (depth + 0.5) * exp(-decay_rate * age)
+    Where ``reuse_count`` is sourced from the admission tracker's
+    observed-hash histogram (already counted by ``observe`` on every
+    `get_num_new_matched_tokens` call). Lower-scored blocks are evicted
+    first, so:
+      - cold prefixes (low reuse_count) evict before hot ones
+      - within a hot prefix, deep blocks evict before shallow ones
+        (preserves chain integrity)
+      - long-idle blocks decay out gradually
 
-    where ``depth`` is the block's index within its request (proxy for
-    attention recompute cost — O(k²) cumulative FLOPs at block index k)
-    and ``age`` is steps since the block was last accessed.
-
-    On allocation pressure, the lowest-score cached blocks are hoisted
-    to the head of the free queue so vLLM's normal popleft eviction
-    targets them first (instead of pure LRU).
-
-    Default decay_rate=0.0 means pure FLOP-cost ranking; small positive
-    values blend in recency to break ties / decay stale deep blocks.
+    Default decay_rate=0.0 keeps pure reuse-and-depth ranking.
     """
 
     def __init__(self, decay_rate: float = 0.0):
-        self.metadata: dict[int, tuple[int, int]] = {}
+        # cpu_block_id -> (depth, last_step, bhash_bytes_or_None)
+        self.metadata: dict[int, tuple[int, int, bytes | None]] = {}
         self.step: int = 0
         self.decay_rate: float = float(decay_rate)
         self.evictions: int = 0
         self.hoisted: int = 0
+        # Callable[[bytes], int] returning observed reuse count for a hash.
+        # Wired in by the scheduler so we don't keep a hard reference loop.
+        self.reuse_count_fn = None
+
+    def bind_reuse_lookup(self, fn) -> None:
+        self.reuse_count_fn = fn
 
     def tick(self) -> None:
         self.step += 1
 
-    def record_store(self, cpu_block_id: int, depth: int) -> None:
-        self.metadata[cpu_block_id] = (int(depth), self.step)
+    def record_store(
+        self, cpu_block_id: int, depth: int, bhash: bytes | None = None
+    ) -> None:
+        self.metadata[cpu_block_id] = (int(depth), self.step, bhash)
 
     def record_access(self, cpu_block_id: int) -> None:
         meta = self.metadata.get(cpu_block_id)
         if meta is not None:
-            self.metadata[cpu_block_id] = (meta[0], self.step)
+            depth, _, bhash = meta
+            self.metadata[cpu_block_id] = (depth, self.step, bhash)
 
     def forget(self, cpu_block_id: int) -> None:
         self.metadata.pop(cpu_block_id, None)
@@ -145,27 +159,48 @@ class MarconiEvictionPolicy:
     def score(self, cpu_block_id: int) -> float:
         meta = self.metadata.get(cpu_block_id)
         if meta is None:
-            # Unknown block (never recorded or already forgotten) -> evict first.
+            # Unknown block -> evict first.
             return -1.0
-        depth, last_step = meta
-        flop = depth + 0.5
+        depth, last_step, bhash = meta
+        reuse = 1
+        if self.reuse_count_fn is not None and bhash is not None:
+            try:
+                reuse = max(1, int(self.reuse_count_fn(bhash)))
+            except Exception:
+                reuse = 1
+        base = reuse / (depth + 1.0)
         if self.decay_rate <= 0.0:
-            return flop
+            return base
         age = self.step - last_step
-        return flop * math.exp(-self.decay_rate * age)
+        return base * math.exp(-self.decay_rate * age)
 
     def stats(self) -> dict[str, float | int]:
-        avg_depth = (
-            sum(d for d, _ in self.metadata.values()) / len(self.metadata)
-            if self.metadata
-            else 0.0
-        )
+        if self.metadata:
+            avg_depth = sum(d for d, _, _ in self.metadata.values()) / len(
+                self.metadata
+            )
+        else:
+            avg_depth = 0.0
+        avg_reuse = 0.0
+        if self.reuse_count_fn is not None and self.metadata:
+            total = 0
+            n = 0
+            for _, _, bhash in self.metadata.values():
+                if bhash is None:
+                    continue
+                try:
+                    total += max(1, int(self.reuse_count_fn(bhash)))
+                    n += 1
+                except Exception:
+                    continue
+            avg_reuse = total / n if n else 0.0
         return {
             "step": self.step,
             "tracked": len(self.metadata),
             "evictions": self.evictions,
             "hoisted": self.hoisted,
             "avg_tracked_depth": round(avg_depth, 2),
+            "avg_tracked_reuse": round(avg_reuse, 2),
         }
 
 
@@ -316,6 +351,10 @@ class SimpleCPUOffloadScheduler:
         if eviction_policy_name == "marconi":
             self._eviction_policy = MarconiEvictionPolicy(
                 decay_rate=eviction_decay,
+            )
+            # Reuse-count comes from the admission tracker's hash histogram.
+            self._eviction_policy.bind_reuse_lookup(
+                lambda bh, t=self._admission_tracker: t.hash_count.get(bh, 0)
             )
             logger.info(
                 "SimpleCPUOffloadScheduler: Marconi eviction enabled, "
@@ -747,8 +786,10 @@ class SimpleCPUOffloadScheduler:
             gpu_block_ids: list[int] = []
             block_hashes_to_store: list[bytes] = []
             # SM70 fork (Phase E.3b): per-admitted-block depth (block index
-            # within the request) to be passed to the eviction policy.
+            # within the request) and raw bhash (admission tracker key)
+            # for the eviction policy.
             depths_to_record: list[int] = []
+            raw_bhashes_to_record: list[bytes] = []
             advanced_per_group: list[int] = [0] * num_groups
             out_of_space = False
             # Confirmed tokens: KV data written and visible to all streams.
@@ -815,6 +856,7 @@ class SimpleCPUOffloadScheduler:
                     # offset / FA_block_size; for sharded groups it tracks
                     # the same logical position.
                     depths_to_record.append(already_stored_g + i)
+                    raw_bhashes_to_record.append(raw_bhash)
                     advanced_per_group[g] += 1
 
                 if out_of_space:
@@ -831,11 +873,16 @@ class SimpleCPUOffloadScheduler:
                 cpu_block_ids = [blk.block_id for blk in cpu_blocks_alloc]
                 for cpu_blk, bhash in zip(cpu_blocks_alloc, block_hashes_to_store):
                     cpu_blk._block_hash = bhash  # type: ignore[assignment]
-                # Record depths for FLOP-aware scoring on future evictions.
+                # Record (depth, raw_bhash) for the reuse-aware eviction
+                # policy. raw_bhash lets score() look up admission count.
                 if self._eviction_policy is not None:
-                    for cpu_blk, depth in zip(cpu_blocks_alloc, depths_to_record):
+                    for cpu_blk, depth, raw_bh in zip(
+                        cpu_blocks_alloc,
+                        depths_to_record,
+                        raw_bhashes_to_record,
+                    ):
                         self._eviction_policy.record_store(
-                            cpu_blk.block_id, depth
+                            cpu_blk.block_id, depth, raw_bh
                         )
             else:
                 cpu_block_ids = []
