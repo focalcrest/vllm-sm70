@@ -125,11 +125,16 @@ class MarconiEvictionPolicy:
     Default decay_rate=0.0 keeps pure reuse-and-depth ranking.
     """
 
-    def __init__(self, decay_rate: float = 0.0):
+    def __init__(self, decay_rate: float = 0.0, reuse_mode: str = "linear"):
         # cpu_block_id -> (depth, last_step, bhash_bytes_or_None)
         self.metadata: dict[int, tuple[int, int, bytes | None]] = {}
         self.step: int = 0
         self.decay_rate: float = float(decay_rate)
+        # "linear" -> reuse_count (concentrates cache on the single hottest
+        # prefix); "log" -> log(1 + reuse_count) (balances hot vs warm,
+        # recommended for Zipfian workloads); "none" -> ignore reuse, pure
+        # gateway preservation.
+        self.reuse_mode: str = str(reuse_mode).lower()
         self.evictions: int = 0
         self.hoisted: int = 0
         # Callable[[bytes], int] returning observed reuse count for a hash.
@@ -138,6 +143,18 @@ class MarconiEvictionPolicy:
 
     def bind_reuse_lookup(self, fn) -> None:
         self.reuse_count_fn = fn
+
+    def _reuse_factor(self, bhash: bytes | None) -> float:
+        if self.reuse_mode == "none" or bhash is None or self.reuse_count_fn is None:
+            return 1.0
+        try:
+            raw = max(1, int(self.reuse_count_fn(bhash)))
+        except Exception:
+            return 1.0
+        if self.reuse_mode == "log":
+            return math.log1p(raw)
+        # default: "linear"
+        return float(raw)
 
     def tick(self) -> None:
         self.step += 1
@@ -162,13 +179,7 @@ class MarconiEvictionPolicy:
             # Unknown block -> evict first.
             return -1.0
         depth, last_step, bhash = meta
-        reuse = 1
-        if self.reuse_count_fn is not None and bhash is not None:
-            try:
-                reuse = max(1, int(self.reuse_count_fn(bhash)))
-            except Exception:
-                reuse = 1
-        base = reuse / (depth + 1.0)
+        base = self._reuse_factor(bhash) / (depth + 1.0)
         if self.decay_rate <= 0.0:
             return base
         age = self.step - last_step
@@ -347,10 +358,14 @@ class SimpleCPUOffloadScheduler:
             extra_cfg.get("eviction_policy", "lru")
         ).lower()
         eviction_decay = float(extra_cfg.get("eviction_decay", 0.0))
+        eviction_reuse_mode = str(
+            extra_cfg.get("eviction_reuse_mode", "linear")
+        ).lower()
         self._eviction_policy: MarconiEvictionPolicy | None = None
         if eviction_policy_name == "marconi":
             self._eviction_policy = MarconiEvictionPolicy(
                 decay_rate=eviction_decay,
+                reuse_mode=eviction_reuse_mode,
             )
             # Reuse-count comes from the admission tracker's hash histogram.
             self._eviction_policy.bind_reuse_lookup(
@@ -358,8 +373,9 @@ class SimpleCPUOffloadScheduler:
             )
             logger.info(
                 "SimpleCPUOffloadScheduler: Marconi eviction enabled, "
-                "decay=%g",
+                "decay=%g, reuse_mode=%s",
                 eviction_decay,
+                eviction_reuse_mode,
             )
 
     @staticmethod
