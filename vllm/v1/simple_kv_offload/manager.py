@@ -451,8 +451,19 @@ class SimpleCPUOffloadScheduler:
         self._pending_promote_pairs: list[tuple[int, int]] = []
         # SM70 fork (Phase E.5b-2): per-request tier choice made by
         # get_num_new_matched_tokens, consumed by update_state_after_alloc.
-        # Values: "l1" or "l2" (only set when hit_length > 0).
+        # Values: "l1", "l2", or "mixed" (only set when hit_length > 0).
+        # "mixed" indicates the chain spans BOTH tiers (Phase E.5b-3 / C).
         self._pending_hit_tier: dict[str, str] = {}
+        # SM70 fork (Phase E.5b-3 / option C): per-group, per-position tier
+        # annotation produced by _find_longest_hit_dual_tier. Lets
+        # update_state_after_alloc route each block to its actual tier
+        # (L1 hits skip promote; L2 hits run promote first). Keyed by
+        # request_id; tuple of lists (one list per kv-cache group).
+        self._pending_hit_per_group_tiers: dict[
+            str, tuple[list[str], ...]
+        ] = {}
+        # Counter for "mixed" tier requests (both L1 and L2 contributed).
+        self._req_mixed_hits: int = 0
 
         eviction_policy_name = str(
             extra_cfg.get("eviction_policy", "lru")
@@ -563,34 +574,44 @@ class SimpleCPUOffloadScheduler:
             self._maybe_log_hit_stats()
             return 0, False
 
-        # SM70 fork (Phase E.5b-2): tier-aware find. Try L1 first, then L2;
-        # pick whichever yields the longer consecutive-prefix hit. This
-        # cannot resolve TRULY mixed-tier chains (e.g., depth-0 in L1 plus
-        # depth-1..N in L2); those degrade to "L1 alone" length here.
-        # Promotion-on-load below moves L2-resident hits into L1 before DMA.
-        l1_blocks, l1_hit = self.cpu_coordinator.find_longest_cache_hit(
-            remaining_hashes, max_hit_len
+        # SM70 fork (Phase E.5b-3 / option C): tier-aware find that handles
+        # genuinely mixed L1/L2 prefixes via "L1 prefix + L2 tail extension".
+        # See _find_longest_hit_dual_tier docstring for the pattern coverage.
+        per_group_blocks, per_group_tiers, hit_length = (
+            self._find_longest_hit_dual_tier(remaining_hashes, max_hit_len)
         )
-        chosen_tier = "l1"
-        hit_length = l1_hit
-        if self._dual_tier and self.l2_coordinator is not None and l1_hit < max_hit_len:
-            _, l2_hit = self.l2_coordinator.find_longest_cache_hit(
-                remaining_hashes, max_hit_len
-            )
-            if l2_hit > l1_hit:
-                chosen_tier = "l2"
-                hit_length = l2_hit
 
         if hit_length > 0:
             self._req_hits += 1
             self._hit_tokens_total += hit_length
-            self._pending_hit_tier[request.request_id] = chosen_tier
-            if chosen_tier == "l1":
+            # Classify request by tier composition: pure L1, pure L2, mixed.
+            # The classification uses the FA group's tier list (all groups
+            # see the same prefix walk; their lengths and tiers should agree).
+            fa_tiers = per_group_tiers[self.fa_gidx] if per_group_tiers else []
+            tiers_set = set(fa_tiers)
+            l1_tokens = sum(
+                self.block_size for t in fa_tiers if t == "l1"
+            )
+            l2_tokens = hit_length - l1_tokens
+            if tiers_set == {"l1"}:
+                summary_tier = "l1"
                 self._req_l1_hits += 1
-                self._tok_l1_hits += hit_length
-            else:
+            elif tiers_set == {"l2"}:
+                summary_tier = "l2"
                 self._req_l2_hits += 1
-                self._tok_l2_hits += hit_length
+            else:
+                summary_tier = "mixed"
+                self._req_mixed_hits += 1
+                # Mixed requests count as a hit for both tiers (each tier
+                # contributed at least one block).
+                self._req_l1_hits += 1
+                self._req_l2_hits += 1
+            self._tok_l1_hits += l1_tokens
+            self._tok_l2_hits += l2_tokens
+            self._pending_hit_tier[request.request_id] = summary_tier
+            self._pending_hit_per_group_tiers[request.request_id] = (
+                per_group_tiers
+            )
             self._maybe_log_hit_stats()
             return hit_length, True
         self._maybe_log_hit_stats()
@@ -610,7 +631,7 @@ class SimpleCPUOffloadScheduler:
             logger.info(
                 "[CPU-OFFLOAD HIT] seen=%d hits=%d req_hit_rate=%.3f "
                 "tok_hit_rate=%.3f hit_tok_sum=%d elig_tok_sum=%d "
-                "l1_req=%d l2_req=%d l1_tok=%d l2_tok=%d",
+                "l1_req=%d l2_req=%d mixed_req=%d l1_tok=%d l2_tok=%d",
                 self._req_seen,
                 self._req_hits,
                 req_rate,
@@ -619,6 +640,7 @@ class SimpleCPUOffloadScheduler:
                 self._req_token_total,
                 self._req_l1_hits,
                 self._req_l2_hits,
+                self._req_mixed_hits,
                 self._tok_l1_hits,
                 self._tok_l2_hits,
             )
@@ -656,11 +678,10 @@ class SimpleCPUOffloadScheduler:
                 num_stored_blocks=[0] * num_groups,
             )
 
-        # SM70 fork (Phase E.5b-2): pop the tier choice that
-        # get_num_new_matched_tokens recorded for this request. Default to
-        # "l1" for safety (covers external callers that bypassed the
-        # connector's gate, though that path is unusual).
-        hit_tier = self._pending_hit_tier.pop(req_id, "l1")
+        # SM70 fork (Phase E.5b-3 / option C): the tier annotation recorded
+        # by get_num_new_matched_tokens drives per-block routing below.
+        hit_tier_summary = self._pending_hit_tier.pop(req_id, "l1")
+        stashed_tiers = self._pending_hit_per_group_tiers.pop(req_id, None)
 
         if num_external_tokens == 0:
             return
@@ -672,20 +693,26 @@ class SimpleCPUOffloadScheduler:
         num_computed_tokens = skipped * self.block_size
         hashes_to_load = request.block_hashes[skipped : skipped + num_blocks_to_load]
 
-        # Find CPU cached blocks across all groups in the chosen tier.
+        # Find CPU cached blocks across all groups, walking BOTH tiers via
+        # the dual-tier helper. The stashed per-block tier annotation from
+        # get_num_new_matched_tokens may not exactly match (other scheduler
+        # actions between the two calls can shift blocks), so we re-walk
+        # and trust the fresh per-block tiers. The asserted invariant is
+        # token-level: total hit must equal num_external_tokens.
         max_hit_len = len(hashes_to_load) * self.block_size
-        source_coordinator = (
-            self.l2_coordinator
-            if hit_tier == "l2" and self.l2_coordinator is not None
-            else self.cpu_coordinator
-        )
-        cpu_hit_blocks, hit_length = source_coordinator.find_longest_cache_hit(
-            hashes_to_load, max_hit_len
+        cpu_hit_blocks, per_block_tiers, hit_length = (
+            self._find_longest_hit_dual_tier(hashes_to_load, max_hit_len)
         )
         assert hit_length == num_external_tokens, (
             f"Expected {num_external_tokens} hit tokens, got {hit_length} "
-            f"(tier={hit_tier})"
+            f"(summary_tier={hit_tier_summary})"
         )
+        if stashed_tiers is None:
+            # Fallback: derive a per-block tier from the summary.
+            num_groups_local = len(per_block_tiers)
+            stashed_tiers = tuple(
+                list(per_block_tiers[g]) for g in range(num_groups_local)
+            )
 
         # Build transfer pairs across all groups.
         total_computed_tokens = num_computed_tokens + num_external_tokens
@@ -717,12 +744,19 @@ class SimpleCPUOffloadScheduler:
                 # Skip null blocks (e.g. sliding window or mamba padding).
                 if cpu_blk.is_null:
                     continue
-                # SM70 fork (Phase E.5b-2): promote L2-resident hits into
-                # L1 before DMA. The promote routine returns an L1 block
-                # with ref_cnt already bumped (get_new_blocks), so we
-                # skip the touch() bookkeeping for those entries.
+                # SM70 fork (Phase E.5b-3 / option C): the per-block tier
+                # annotation tells us EXACTLY which tier this hit came
+                # from, so the routing decision is per-block, not
+                # per-request. Promote L2-resident blocks before DMA;
+                # promoted blocks already carry ref_cnt=1 from
+                # get_new_blocks and skip the subsequent touch() pass.
+                blk_tier = (
+                    per_block_tiers[g][i]
+                    if g < len(per_block_tiers) and i < len(per_block_tiers[g])
+                    else "l1"
+                )
                 already_touched = False
-                if hit_tier == "l2":
+                if blk_tier == "l2":
                     promoted = self._promote_l2_block_to_l1(cpu_blk)
                     if promoted is None:
                         # No L1 slot available — can't honor this hit;
@@ -1070,6 +1104,64 @@ class SimpleCPUOffloadScheduler:
             # for future L2 hits.
             self.l2_block_pool.free_blocks([l2_blk])
         return pairs
+
+    def _find_longest_hit_dual_tier(
+        self, remaining_hashes, max_hit_len: int
+    ) -> tuple[tuple[list, ...], tuple[list[str], ...], int]:
+        """SM70 fork (Phase E.5b-3 / option C): tier-aware longest-cache-hit
+        walk that handles genuinely mixed L1/L2 prefixes.
+
+        Strategy: ask L1's coordinator for its longest hit; then, if the
+        chain didn't cover ``max_hit_len``, ask L2's coordinator to extend
+        the suffix. Per-block tier annotations let the caller route each
+        block to the correct tier on the load path.
+
+        Pattern coverage:
+          - Pure L1 prefix:       length covered entirely from L1.
+          - Pure L2 prefix:       L1 returns 0; L2 walks from offset 0.
+          - L1 prefix + L2 tail:  Marconi-typical (gateway in L1, demoted
+                                  depths in L2).
+
+        Pattern NOT covered (rare in steady-state Marconi):
+          - L2 prefix + L1 tail (would require re-admit of a later block
+            while keeping an earlier block in L2). Would need an extra
+            L2-first attempt + alternation; not worth the complexity
+            until production traffic shows the gap matters.
+
+        Returns:
+          per_group_blocks:  tuple of per-group KVCacheBlock lists,
+                             length matches L1 hit + L2 tail hit.
+          per_group_tiers:   parallel list of "l1"/"l2" strings.
+          total_hit_length:  total tokens covered (l1_hit + l2_tail_hit).
+        """
+        num_groups = len(self.cpu_kv_cache_config.kv_cache_groups)
+        l1_blocks, l1_hit = self.cpu_coordinator.find_longest_cache_hit(
+            remaining_hashes, max_hit_len
+        )
+        out_blocks: list[list] = [list(l1_blocks[g]) for g in range(num_groups)]
+        out_tiers: list[list[str]] = [
+            ["l1"] * len(l1_blocks[g]) for g in range(num_groups)
+        ]
+        total_hit = l1_hit
+
+        if (
+            self._dual_tier
+            and self.l2_coordinator is not None
+            and l1_hit < max_hit_len
+        ):
+            l1_blocks_consumed = l1_hit // self.block_size
+            if l1_blocks_consumed < len(remaining_hashes):
+                suffix_hashes = remaining_hashes[l1_blocks_consumed:]
+                l2_blocks, l2_hit = self.l2_coordinator.find_longest_cache_hit(
+                    suffix_hashes, max_hit_len - l1_hit
+                )
+                if l2_hit > 0:
+                    for g in range(num_groups):
+                        out_blocks[g].extend(l2_blocks[g])
+                        out_tiers[g].extend(["l2"] * len(l2_blocks[g]))
+                    total_hit += l2_hit
+
+        return tuple(out_blocks), tuple(out_tiers), total_hit
 
     def _promote_l2_block_to_l1(
         self, l2_block: "KVCacheBlock"
