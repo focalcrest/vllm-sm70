@@ -126,8 +126,13 @@ class MarconiEvictionPolicy:
     """
 
     def __init__(self, decay_rate: float = 0.0, reuse_mode: str = "linear"):
-        # cpu_block_id -> (depth, last_step, bhash_bytes_or_None)
-        self.metadata: dict[int, tuple[int, int, bytes | None]] = {}
+        # SM70 fork (Phase E.5b): metadata is keyed by (tier, block_id).
+        # Tier is a string ("l1" / "l2") so L1/L2 block_ids don't collide.
+        # Existing single-tier callers omit the tier arg; the default "l1"
+        # preserves the previous behavior.
+        self.metadata: dict[
+            tuple[str, int], tuple[int, int, bytes | None]
+        ] = {}
         self.step: int = 0
         self.decay_rate: float = float(decay_rate)
         # "linear" -> reuse_count (concentrates cache on the single hottest
@@ -137,6 +142,9 @@ class MarconiEvictionPolicy:
         self.reuse_mode: str = str(reuse_mode).lower()
         self.evictions: int = 0
         self.hoisted: int = 0
+        # Tier-counter for Phase E.5b orchestration diagnostics.
+        self.demotes: int = 0
+        self.promotes: int = 0
         # Callable[[bytes], int] returning observed reuse count for a hash.
         # Wired in by the scheduler so we don't keep a hard reference loop.
         self.reuse_count_fn = None
@@ -160,21 +168,41 @@ class MarconiEvictionPolicy:
         self.step += 1
 
     def record_store(
-        self, cpu_block_id: int, depth: int, bhash: bytes | None = None
+        self,
+        cpu_block_id: int,
+        depth: int,
+        bhash: bytes | None = None,
+        tier: str = "l1",
     ) -> None:
-        self.metadata[cpu_block_id] = (int(depth), self.step, bhash)
+        self.metadata[(tier, cpu_block_id)] = (int(depth), self.step, bhash)
 
-    def record_access(self, cpu_block_id: int) -> None:
-        meta = self.metadata.get(cpu_block_id)
+    def record_access(self, cpu_block_id: int, tier: str = "l1") -> None:
+        key = (tier, cpu_block_id)
+        meta = self.metadata.get(key)
         if meta is not None:
             depth, _, bhash = meta
-            self.metadata[cpu_block_id] = (depth, self.step, bhash)
+            self.metadata[key] = (depth, self.step, bhash)
 
-    def forget(self, cpu_block_id: int) -> None:
-        self.metadata.pop(cpu_block_id, None)
+    def forget(self, cpu_block_id: int, tier: str = "l1") -> None:
+        self.metadata.pop((tier, cpu_block_id), None)
 
-    def score(self, cpu_block_id: int) -> float:
-        meta = self.metadata.get(cpu_block_id)
+    def transfer_tier(
+        self, src_tier: str, src_id: int, dst_tier: str, dst_id: int
+    ) -> None:
+        """SM70 fork (E.5b): move metadata across tiers on demote/promote.
+
+        Keeps depth, last_step, bhash intact; only the tier+block_id key
+        changes. If src has no entry (block was untracked, e.g., evicted
+        before we got here), this is a no-op.
+        """
+        src_key = (src_tier, src_id)
+        meta = self.metadata.pop(src_key, None)
+        if meta is None:
+            return
+        self.metadata[(dst_tier, dst_id)] = meta
+
+    def score(self, cpu_block_id: int, tier: str = "l1") -> float:
+        meta = self.metadata.get((tier, cpu_block_id))
         if meta is None:
             # Unknown block -> evict first.
             return -1.0
@@ -205,11 +233,17 @@ class MarconiEvictionPolicy:
                 except Exception:
                     continue
             avg_reuse = total / n if n else 0.0
+        n_l1 = sum(1 for (t, _) in self.metadata if t == "l1")
+        n_l2 = sum(1 for (t, _) in self.metadata if t == "l2")
         return {
             "step": self.step,
             "tracked": len(self.metadata),
+            "l1": n_l1,
+            "l2": n_l2,
             "evictions": self.evictions,
             "hoisted": self.hoisted,
+            "demotes": self.demotes,
+            "promotes": self.promotes,
             "avg_tracked_depth": round(avg_depth, 2),
             "avg_tracked_reuse": round(avg_reuse, 2),
         }
@@ -364,6 +398,50 @@ class SimpleCPUOffloadScheduler:
         # extra_config["eviction_policy"] = "marconi" enables score-based
         # eviction; default "lru" preserves the upstream behavior.
         # extra_config["eviction_decay"] = float blends recency into score.
+        # SM70 fork (Phase E.5b): optional L2 tier (XFS on NVMe). When
+        # ``l2_pool_path`` and ``l2_bytes_to_use`` are set in extra_config
+        # (must match the worker's settings), we build a separate
+        # BlockPool/Coordinator for the L2 tier and run a tier-aware
+        # admit/promote/demote orchestration on top of the existing
+        # single-tier code paths.
+        l2_capacity_bytes = int(extra_cfg.get("l2_bytes_to_use", 0) or 0)
+        l2_pool_path_present = bool(extra_cfg.get("l2_pool_path"))
+        self._dual_tier: bool = l2_capacity_bytes > 0 and l2_pool_path_present
+        self.l2_kv_cache_config: KVCacheConfig | None = None
+        self.l2_coordinator: KVCacheCoordinator | None = None
+        self.l2_block_pool: BlockPool | None = None
+        self.num_l2_blocks: int = 0
+        if self._dual_tier:
+            self.l2_kv_cache_config = self._derive_cpu_config(
+                kv_cache_config, l2_capacity_bytes
+            )
+            self.num_l2_blocks = self.l2_kv_cache_config.num_blocks
+            self.l2_coordinator = get_kv_cache_coordinator(
+                kv_cache_config=self.l2_kv_cache_config,
+                max_model_len=vllm_config.model_config.max_model_len,
+                use_eagle=False,
+                enable_caching=True,
+                enable_kv_cache_events=False,  # L2 is internal; no events
+                dcp_world_size=dcp_world_size,
+                pcp_world_size=pcp_world_size,
+                hash_block_size=self.block_size,
+            )
+            self.l2_block_pool = self.l2_coordinator.block_pool
+            logger.info(
+                "SimpleCPUOffloadScheduler: L2 tier enabled, "
+                "num_l2_blocks=%d (%.2f GB)",
+                self.num_l2_blocks,
+                l2_capacity_bytes / (1024**3),
+            )
+
+        # SM70 fork (Phase E.5b): hit-rate split across tiers + miss.
+        # Updated alongside the existing _req_seen / _req_hits / _req_token
+        # counters whenever get_num_new_matched_tokens decides.
+        self._req_l1_hits: int = 0
+        self._req_l2_hits: int = 0
+        self._tok_l1_hits: int = 0
+        self._tok_l2_hits: int = 0
+
         eviction_policy_name = str(
             extra_cfg.get("eviction_policy", "lru")
         ).lower()
@@ -724,8 +802,13 @@ class SimpleCPUOffloadScheduler:
 
         return gpu_ids, cpu_ids, []
 
-    def _hoist_victims_to_head(self, n_needed: int) -> None:
-        """SM70 fork (Phase E.3b): rearrange CPU pool's free queue so the
+    def _hoist_victims_to_head(
+        self,
+        n_needed: int,
+        tier: str = "l1",
+        block_pool: BlockPool | None = None,
+    ) -> None:
+        """SM70 fork (Phase E.3b/E.5b): rearrange a tier's free queue so the
         n_needed lowest-score cached blocks land at the head, where
         ``BlockPool.get_new_blocks`` will pop them first.
 
@@ -733,13 +816,15 @@ class SimpleCPUOffloadScheduler:
         pristine-free), scores each, sorts ascending, then surgically
         re-links the lowest-N to the queue head via the linked-list ops.
 
-        No-op when eviction policy is None, when n_needed <= 0, when the
-        queue isn't full enough to need re-ordering, or when the queue
-        is already saturated (whole tail will be evicted anyway under LRU).
+        ``tier`` selects which Marconi metadata namespace to score
+        against. ``block_pool`` defaults to the L1 pool to preserve
+        Phase E.3b behavior; pass the L2 pool to hoist L2 victims for
+        demote/drop decisions.
         """
         if self._eviction_policy is None or n_needed <= 0:
             return
-        fq = self.cpu_block_pool.free_block_queue
+        pool = block_pool if block_pool is not None else self.cpu_block_pool
+        fq = pool.free_block_queue
         if fq.num_free_blocks <= n_needed:
             # Whole queue will be drained; ordering is irrelevant.
             return
@@ -760,7 +845,7 @@ class SimpleCPUOffloadScheduler:
         # BEFORE sorting so we can detect "no reorder needed".
         existing_head_ids = {n.block_id for n in nodes[:n_needed]}
         # Sort ascending by score, tie-break by block_id for determinism.
-        nodes.sort(key=lambda n: (policy.score(n.block_id), n.block_id))
+        nodes.sort(key=lambda n: (policy.score(n.block_id, tier), n.block_id))
         victims = nodes[:n_needed]
 
         # If LRU's natural victim set equals Marconi's, no re-link needed.
@@ -770,7 +855,7 @@ class SimpleCPUOffloadScheduler:
         # Remove victims from current positions and prepend at head.
         for v in victims:
             fq.remove(v)
-            policy.forget(v.block_id)
+            policy.forget(v.block_id, tier)
 
         fake_head = fq.fake_free_list_head
         after_head = fake_head.next_free_block
