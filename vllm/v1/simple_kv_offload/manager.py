@@ -299,6 +299,16 @@ class SimpleCPUOffloadScheduler:
         # GPU block pool reference - bound after scheduler builds kv_cache_manager
         self._gpu_block_pool: BlockPool | None = None
 
+        # SM70 fork: hit-rate instrumentation for the CPU offload path.
+        # Counters are incremented inside get_num_new_matched_tokens; a
+        # cumulative summary is logged every _hit_log_every requests so
+        # external tooling can grep the log.
+        self._req_seen: int = 0
+        self._req_hits: int = 0
+        self._hit_tokens_total: int = 0
+        self._req_token_total: int = 0
+        self._hit_log_every: int = 10
+
         # Load metadata
         self._reqs_to_load: dict[str, LoadRequestState] = {}
         # Inverse map: load_event_idx -> req_ids. Keyed by load_event_idx because
@@ -444,20 +454,56 @@ class SimpleCPUOffloadScheduler:
         for bh in remaining_hashes:
             self._admission_tracker.observe(bh)
 
+        # SM70 fork: per-request hit-rate tracking. We measure prospective
+        # CPU hit length on the *uncovered* suffix (after the GPU prefix
+        # cache has done its work). hit_length=0 means "GPU prefix did the
+        # work or pure recompute"; hit_length>0 means CPU pool saved this
+        # request some prefill compute.
+        self._req_seen += 1
+        eligible_tokens = max(0, request.num_tokens - 1 - num_computed_tokens)
+        self._req_token_total += eligible_tokens
+
         if not remaining_hashes:
+            self._maybe_log_hit_stats()
             return 0, False
         # Must recompute at least the last token, matching the logic in
         # kv_cache_manager.get_computed_blocks().
         max_hit_len = request.num_tokens - 1 - num_computed_tokens
         if max_hit_len <= 0:
+            self._maybe_log_hit_stats()
             return 0, False
         _, hit_length = self.cpu_coordinator.find_longest_cache_hit(
             remaining_hashes, max_hit_len
         )
 
         if hit_length > 0:
+            self._req_hits += 1
+            self._hit_tokens_total += hit_length
+            self._maybe_log_hit_stats()
             return hit_length, True
+        self._maybe_log_hit_stats()
         return 0, False
+
+    def _maybe_log_hit_stats(self) -> None:
+        """Emit a cumulative CPU-pool hit-rate summary every N requests."""
+        if self._req_seen == 0 or self._req_seen % self._hit_log_every != 0:
+            return
+        req_rate = self._req_hits / self._req_seen
+        tok_rate = (
+            self._hit_tokens_total / self._req_token_total
+            if self._req_token_total > 0
+            else 0.0
+        )
+        logger.info(
+            "[CPU-OFFLOAD HIT] seen=%d hits=%d req_hit_rate=%.3f "
+            "tok_hit_rate=%.3f hit_tok_sum=%d elig_tok_sum=%d",
+            self._req_seen,
+            self._req_hits,
+            req_rate,
+            tok_rate,
+            self._hit_tokens_total,
+            self._req_token_total,
+        )
 
     # TODO(yifan): this API now only matches the suffix part of the prefix cache. A more
     # general API should scan blocks in both GPU and CPU block pool in a single pass.
