@@ -449,6 +449,10 @@ class SimpleCPUOffloadScheduler:
         # can execute the corresponding CPU memcpys before any DMA.
         self._pending_demote_pairs: list[tuple[int, int]] = []
         self._pending_promote_pairs: list[tuple[int, int]] = []
+        # SM70 fork (Phase E.5b-2): per-request tier choice made by
+        # get_num_new_matched_tokens, consumed by update_state_after_alloc.
+        # Values: "l1" or "l2" (only set when hit_length > 0).
+        self._pending_hit_tier: dict[str, str] = {}
 
         eviction_policy_name = str(
             extra_cfg.get("eviction_policy", "lru")
@@ -558,13 +562,35 @@ class SimpleCPUOffloadScheduler:
         if max_hit_len <= 0:
             self._maybe_log_hit_stats()
             return 0, False
-        _, hit_length = self.cpu_coordinator.find_longest_cache_hit(
+
+        # SM70 fork (Phase E.5b-2): tier-aware find. Try L1 first, then L2;
+        # pick whichever yields the longer consecutive-prefix hit. This
+        # cannot resolve TRULY mixed-tier chains (e.g., depth-0 in L1 plus
+        # depth-1..N in L2); those degrade to "L1 alone" length here.
+        # Promotion-on-load below moves L2-resident hits into L1 before DMA.
+        l1_blocks, l1_hit = self.cpu_coordinator.find_longest_cache_hit(
             remaining_hashes, max_hit_len
         )
+        chosen_tier = "l1"
+        hit_length = l1_hit
+        if self._dual_tier and self.l2_coordinator is not None and l1_hit < max_hit_len:
+            _, l2_hit = self.l2_coordinator.find_longest_cache_hit(
+                remaining_hashes, max_hit_len
+            )
+            if l2_hit > l1_hit:
+                chosen_tier = "l2"
+                hit_length = l2_hit
 
         if hit_length > 0:
             self._req_hits += 1
             self._hit_tokens_total += hit_length
+            self._pending_hit_tier[request.request_id] = chosen_tier
+            if chosen_tier == "l1":
+                self._req_l1_hits += 1
+                self._tok_l1_hits += hit_length
+            else:
+                self._req_l2_hits += 1
+                self._tok_l2_hits += hit_length
             self._maybe_log_hit_stats()
             return hit_length, True
         self._maybe_log_hit_stats()
@@ -580,6 +606,23 @@ class SimpleCPUOffloadScheduler:
             if self._req_token_total > 0
             else 0.0
         )
+        if self._dual_tier:
+            logger.info(
+                "[CPU-OFFLOAD HIT] seen=%d hits=%d req_hit_rate=%.3f "
+                "tok_hit_rate=%.3f hit_tok_sum=%d elig_tok_sum=%d "
+                "l1_req=%d l2_req=%d l1_tok=%d l2_tok=%d",
+                self._req_seen,
+                self._req_hits,
+                req_rate,
+                tok_rate,
+                self._hit_tokens_total,
+                self._req_token_total,
+                self._req_l1_hits,
+                self._req_l2_hits,
+                self._tok_l1_hits,
+                self._tok_l2_hits,
+            )
+            return
         logger.info(
             "[CPU-OFFLOAD HIT] seen=%d hits=%d req_hit_rate=%.3f "
             "tok_hit_rate=%.3f hit_tok_sum=%d elig_tok_sum=%d",
@@ -613,6 +656,12 @@ class SimpleCPUOffloadScheduler:
                 num_stored_blocks=[0] * num_groups,
             )
 
+        # SM70 fork (Phase E.5b-2): pop the tier choice that
+        # get_num_new_matched_tokens recorded for this request. Default to
+        # "l1" for safety (covers external callers that bypassed the
+        # connector's gate, though that path is unusual).
+        hit_tier = self._pending_hit_tier.pop(req_id, "l1")
+
         if num_external_tokens == 0:
             return
 
@@ -623,13 +672,19 @@ class SimpleCPUOffloadScheduler:
         num_computed_tokens = skipped * self.block_size
         hashes_to_load = request.block_hashes[skipped : skipped + num_blocks_to_load]
 
-        # Find CPU cached blocks across all groups.
+        # Find CPU cached blocks across all groups in the chosen tier.
         max_hit_len = len(hashes_to_load) * self.block_size
-        cpu_hit_blocks, hit_length = self.cpu_coordinator.find_longest_cache_hit(
+        source_coordinator = (
+            self.l2_coordinator
+            if hit_tier == "l2" and self.l2_coordinator is not None
+            else self.cpu_coordinator
+        )
+        cpu_hit_blocks, hit_length = source_coordinator.find_longest_cache_hit(
             hashes_to_load, max_hit_len
         )
         assert hit_length == num_external_tokens, (
-            f"Expected {num_external_tokens} hit tokens, got {hit_length}"
+            f"Expected {num_external_tokens} hit tokens, got {hit_length} "
+            f"(tier={hit_tier})"
         )
 
         # Build transfer pairs across all groups.
@@ -639,6 +694,10 @@ class SimpleCPUOffloadScheduler:
         gpu_block_ids: list[int] = []
         cpu_block_ids: list[int] = []
         cpu_blocks_to_touch: list[KVCacheBlock] = []
+        # SM70 fork (Phase E.5b-2): blocks freshly promoted from L2 already
+        # carry ref_cnt=1 from get_new_blocks(), so they must NOT go through
+        # touch() a second time (which would leak a ref).
+        cpu_blocks_already_held: list[KVCacheBlock] = []
 
         for g in range(num_groups):
             cpu_blocks_g = cpu_hit_blocks[g]
@@ -658,11 +717,29 @@ class SimpleCPUOffloadScheduler:
                 # Skip null blocks (e.g. sliding window or mamba padding).
                 if cpu_blk.is_null:
                     continue
+                # SM70 fork (Phase E.5b-2): promote L2-resident hits into
+                # L1 before DMA. The promote routine returns an L1 block
+                # with ref_cnt already bumped (get_new_blocks), so we
+                # skip the touch() bookkeeping for those entries.
+                already_touched = False
+                if hit_tier == "l2":
+                    promoted = self._promote_l2_block_to_l1(cpu_blk)
+                    if promoted is None:
+                        # No L1 slot available — can't honor this hit;
+                        # skip the block (caller will recompute).
+                        continue
+                    cpu_blk = promoted
+                    already_touched = True
                 gpu_block_ids.append(group_gpu_ids[gpu_ext_start + i])
                 cpu_block_ids.append(cpu_blk.block_id)
-                cpu_blocks_to_touch.append(cpu_blk)
+                if already_touched:
+                    cpu_blocks_already_held.append(cpu_blk)
+                else:
+                    cpu_blocks_to_touch.append(cpu_blk)
 
-        # Touch CPU blocks to prevent eviction during async load.
+        # Touch L1-resident hit blocks (ref_cnt 0 -> 1). Promoted blocks
+        # already came back from get_new_blocks at ref_cnt=1, so we don't
+        # double-bump them.
         self.cpu_block_pool.touch(cpu_blocks_to_touch)
 
         # SM70 fork (Phase E.3b): record CPU-block accesses for the eviction
@@ -670,6 +747,11 @@ class SimpleCPUOffloadScheduler:
         if self._eviction_policy is not None:
             for blk in cpu_blocks_to_touch:
                 self._eviction_policy.record_access(blk.block_id)
+            for blk in cpu_blocks_already_held:
+                # Promoted blocks are now L1-resident; bookkeep recency.
+                self._eviction_policy.record_access(
+                    blk.block_id, tier="l1"
+                )
 
         # Touch GPU blocks to prevent freeing during async load
         assert self._gpu_block_pool is not None
@@ -989,6 +1071,76 @@ class SimpleCPUOffloadScheduler:
             self.l2_block_pool.free_blocks([l2_blk])
         return pairs
 
+    def _promote_l2_block_to_l1(
+        self, l2_block: "KVCacheBlock"
+    ) -> "KVCacheBlock | None":
+        """SM70 fork (Phase E.5b-2): move a single L2-resident cached block
+        to L1, allocating an L1 slot (with possible Marconi-driven demote
+        cascade) and emitting promote/demote pairs onto the pending queues.
+
+        Returns the new L1-resident KVCacheBlock with ref_cnt=1 (caller
+        is responsible for touch/free accounting), or None if no L1 slot
+        could be allocated.
+
+        If the same hash already lives in L1's cache map (rare, can happen
+        if a previous step admitted the same hash to L1 while it was also
+        in L2), returns the existing L1 block and just removes the L2
+        entry to restore the "hash exists in exactly one tier" invariant.
+        """
+        if (
+            not self._dual_tier
+            or self.l2_block_pool is None
+            or l2_block.is_null
+        ):
+            return None
+        bhash = l2_block.block_hash
+        if bhash is None:
+            return None
+        # Edge case: hash already in L1. Re-use the L1 block, drop the L2
+        # duplicate, and skip the memcpy.
+        existing_l1 = self.cpu_block_pool.cached_block_hash_to_block.get_one_block(
+            bhash
+        )
+        if existing_l1 is not None:
+            self.l2_block_pool.cached_block_hash_to_block.pop(
+                bhash, l2_block.block_id
+            )
+            l2_block.reset_hash()
+            if self._eviction_policy is not None:
+                self._eviction_policy.forget(l2_block.block_id, tier="l2")
+            return existing_l1
+
+        # Make room in L1: hoist and possibly demote the L1 victim to L2.
+        self._hoist_victims_to_head(1)
+        demoted = self._demote_l1_victims_for_admission(1)
+        if demoted:
+            self._pending_demote_pairs.extend(demoted)
+
+        # Allocate one L1 slot. May still drop an L1 victim's hash if L2
+        # was full and the demote helper couldn't relocate it.
+        if self.cpu_block_pool.get_num_free_blocks() <= 0:
+            return None
+        l1_blocks = self.cpu_block_pool.get_new_blocks(1)
+        l1_block = l1_blocks[0]
+        # Stamp hash on L1; move cache-map entry from L2 to L1.
+        l1_block._block_hash = bhash  # type: ignore[assignment]
+        self.cpu_block_pool.cached_block_hash_to_block.insert(bhash, l1_block)
+        self.l2_block_pool.cached_block_hash_to_block.pop(
+            bhash, l2_block.block_id
+        )
+        l2_block.reset_hash()
+        # Transfer Marconi metadata.
+        if self._eviction_policy is not None:
+            self._eviction_policy.transfer_tier(
+                "l2", l2_block.block_id, "l1", l1_block.block_id
+            )
+            self._eviction_policy.promotes += 1
+        # Emit the worker-side memcpy pair (L2 src -> L1 dst).
+        self._pending_promote_pairs.append(
+            (l2_block.block_id, l1_block.block_id)
+        )
+        return l1_block
+
     def _prepare_eager_store_specs(
         self, scheduler_output: SchedulerOutput
     ) -> tuple[list[int], list[int], list[str]]:
@@ -1083,13 +1235,25 @@ class SimpleCPUOffloadScheduler:
                         break
 
                     # Check if this group's data is already scheduled for store
-                    # in this step or already cached in CPU.
+                    # in this step or already cached in CPU (L1 or, in
+                    # dual-tier mode, L2). The L2 check maintains the
+                    # exclusivity invariant: a given hash lives in at
+                    # most one tier at a time.
+                    already_l2 = (
+                        self._dual_tier
+                        and self.l2_block_pool is not None
+                        and self.l2_block_pool.cached_block_hash_to_block.get_one_block(
+                            bhash_with_group
+                        )
+                        is not None
+                    )
                     if (
                         gpu_block_id in gpu_blocks_this_step
                         or cpu_block_pool.cached_block_hash_to_block.get_one_block(
                             bhash_with_group
                         )
                         is not None
+                        or already_l2
                     ):
                         advanced_per_group[g] += 1
                         continue
