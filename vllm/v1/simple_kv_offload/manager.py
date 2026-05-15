@@ -3,6 +3,7 @@
 """Scheduler-side manager for SimpleCPUOffloadConnector."""
 
 import contextlib
+import math
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -95,6 +96,76 @@ class MarconiAdmissionTracker:
             "hot_hashes": sum(
                 1 for c in self.hash_count.values() if c >= self.threshold
             ),
+        }
+
+
+class MarconiEvictionPolicy:
+    """SM70 fork (Phase E.3b): FLOP-aware eviction policy.
+
+    Pairs with [[MarconiAdmissionTracker]] to complete the Marconi
+    algorithm from "Prefix Caching for the Era of Hybrid LLMs" (NSDI'25).
+
+    Each cached CPU block is scored by:
+
+        score = (depth + 0.5) * exp(-decay_rate * age)
+
+    where ``depth`` is the block's index within its request (proxy for
+    attention recompute cost — O(k²) cumulative FLOPs at block index k)
+    and ``age`` is steps since the block was last accessed.
+
+    On allocation pressure, the lowest-score cached blocks are hoisted
+    to the head of the free queue so vLLM's normal popleft eviction
+    targets them first (instead of pure LRU).
+
+    Default decay_rate=0.0 means pure FLOP-cost ranking; small positive
+    values blend in recency to break ties / decay stale deep blocks.
+    """
+
+    def __init__(self, decay_rate: float = 0.0):
+        self.metadata: dict[int, tuple[int, int]] = {}
+        self.step: int = 0
+        self.decay_rate: float = float(decay_rate)
+        self.evictions: int = 0
+        self.hoisted: int = 0
+
+    def tick(self) -> None:
+        self.step += 1
+
+    def record_store(self, cpu_block_id: int, depth: int) -> None:
+        self.metadata[cpu_block_id] = (int(depth), self.step)
+
+    def record_access(self, cpu_block_id: int) -> None:
+        meta = self.metadata.get(cpu_block_id)
+        if meta is not None:
+            self.metadata[cpu_block_id] = (meta[0], self.step)
+
+    def forget(self, cpu_block_id: int) -> None:
+        self.metadata.pop(cpu_block_id, None)
+
+    def score(self, cpu_block_id: int) -> float:
+        meta = self.metadata.get(cpu_block_id)
+        if meta is None:
+            # Unknown block (never recorded or already forgotten) -> evict first.
+            return -1.0
+        depth, last_step = meta
+        flop = depth + 0.5
+        if self.decay_rate <= 0.0:
+            return flop
+        age = self.step - last_step
+        return flop * math.exp(-self.decay_rate * age)
+
+    def stats(self) -> dict[str, float | int]:
+        avg_depth = (
+            sum(d for d, _ in self.metadata.values()) / len(self.metadata)
+            if self.metadata
+            else 0.0
+        )
+        return {
+            "step": self.step,
+            "tracked": len(self.metadata),
+            "evictions": self.evictions,
+            "hoisted": self.hoisted,
+            "avg_tracked_depth": round(avg_depth, 2),
         }
 
 
@@ -231,6 +302,25 @@ class SimpleCPUOffloadScheduler:
                 "SimpleCPUOffloadScheduler: Marconi admission enabled, "
                 "threshold=%d",
                 admission_threshold,
+            )
+
+        # SM70 fork (Phase E.3b): FLOP-aware eviction policy.
+        # extra_config["eviction_policy"] = "marconi" enables score-based
+        # eviction; default "lru" preserves the upstream behavior.
+        # extra_config["eviction_decay"] = float blends recency into score.
+        eviction_policy_name = str(
+            extra_cfg.get("eviction_policy", "lru")
+        ).lower()
+        eviction_decay = float(extra_cfg.get("eviction_decay", 0.0))
+        self._eviction_policy: MarconiEvictionPolicy | None = None
+        if eviction_policy_name == "marconi":
+            self._eviction_policy = MarconiEvictionPolicy(
+                decay_rate=eviction_decay,
+            )
+            logger.info(
+                "SimpleCPUOffloadScheduler: Marconi eviction enabled, "
+                "decay=%g",
+                eviction_decay,
             )
 
     @staticmethod
@@ -388,6 +478,12 @@ class SimpleCPUOffloadScheduler:
         # Touch CPU blocks to prevent eviction during async load.
         self.cpu_block_pool.touch(cpu_blocks_to_touch)
 
+        # SM70 fork (Phase E.3b): record CPU-block accesses for the eviction
+        # policy so deep/hot blocks see their recency refreshed on each hit.
+        if self._eviction_policy is not None:
+            for blk in cpu_blocks_to_touch:
+                self._eviction_policy.record_access(blk.block_id)
+
         # Touch GPU blocks to prevent freeing during async load
         assert self._gpu_block_pool is not None
         self._gpu_block_pool.touch(
@@ -527,6 +623,69 @@ class SimpleCPUOffloadScheduler:
 
         return gpu_ids, cpu_ids, []
 
+    def _hoist_victims_to_head(self, n_needed: int) -> None:
+        """SM70 fork (Phase E.3b): rearrange CPU pool's free queue so the
+        n_needed lowest-score cached blocks land at the head, where
+        ``BlockPool.get_new_blocks`` will pop them first.
+
+        Walks the free queue (cached-and-free blocks are interleaved with
+        pristine-free), scores each, sorts ascending, then surgically
+        re-links the lowest-N to the queue head via the linked-list ops.
+
+        No-op when eviction policy is None, when n_needed <= 0, when the
+        queue isn't full enough to need re-ordering, or when the queue
+        is already saturated (whole tail will be evicted anyway under LRU).
+        """
+        if self._eviction_policy is None or n_needed <= 0:
+            return
+        fq = self.cpu_block_pool.free_block_queue
+        if fq.num_free_blocks <= n_needed:
+            # Whole queue will be drained; ordering is irrelevant.
+            return
+
+        # Walk full queue collecting nodes (bounded by num_free_blocks).
+        fake_tail = fq.fake_free_list_tail
+        node = fq.fake_free_list_head.next_free_block
+        nodes: list = []
+        while node is not None and node is not fake_tail:
+            nodes.append(node)
+            node = node.next_free_block
+
+        if len(nodes) <= n_needed:
+            return
+
+        policy = self._eviction_policy
+        # Snapshot the queue's current head order (LRU's eviction set)
+        # BEFORE sorting so we can detect "no reorder needed".
+        existing_head_ids = {n.block_id for n in nodes[:n_needed]}
+        # Sort ascending by score, tie-break by block_id for determinism.
+        nodes.sort(key=lambda n: (policy.score(n.block_id), n.block_id))
+        victims = nodes[:n_needed]
+
+        # If LRU's natural victim set equals Marconi's, no re-link needed.
+        if existing_head_ids == {v.block_id for v in victims}:
+            return
+
+        # Remove victims from current positions and prepend at head.
+        for v in victims:
+            fq.remove(v)
+            policy.forget(v.block_id)
+
+        fake_head = fq.fake_free_list_head
+        after_head = fake_head.next_free_block
+        prev = fake_head
+        for v in victims:
+            v.prev_free_block = prev
+            prev.next_free_block = v
+            prev = v
+        prev.next_free_block = after_head
+        if after_head is not None:
+            after_head.prev_free_block = prev
+
+        fq.num_free_blocks += len(victims)
+        policy.hoisted += len(victims)
+        policy.evictions += len(victims)
+
     def _prepare_eager_store_specs(
         self, scheduler_output: SchedulerOutput
     ) -> tuple[list[int], list[int], list[str]]:
@@ -544,6 +703,10 @@ class SimpleCPUOffloadScheduler:
         # tracker stats only when this call actually did something.
         _admit_before = self._admission_tracker.admitted
         _reject_before = self._admission_tracker.rejected
+
+        # SM70 fork (Phase E.3b): tick step counter for age-based decay.
+        if self._eviction_policy is not None:
+            self._eviction_policy.tick()
 
         merged_gpu_block_ids: list[int] = []
         merged_cpu_block_ids: list[int] = []
@@ -583,6 +746,9 @@ class SimpleCPUOffloadScheduler:
             # --- Phase 1: Scan blocks, classify as cached vs to-store ---
             gpu_block_ids: list[int] = []
             block_hashes_to_store: list[bytes] = []
+            # SM70 fork (Phase E.3b): per-admitted-block depth (block index
+            # within the request) to be passed to the eviction policy.
+            depths_to_record: list[int] = []
             advanced_per_group: list[int] = [0] * num_groups
             out_of_space = False
             # Confirmed tokens: KV data written and visible to all streams.
@@ -601,7 +767,7 @@ class SimpleCPUOffloadScheduler:
                 ready_blocks_g = confirmed_tokens // g_block_size
                 scannable = group_gpu_ids[already_stored_g:ready_blocks_g]
 
-                for gpu_block_id in scannable:
+                for i, gpu_block_id in enumerate(scannable):
                     gpu_block = gpu_block_pool.blocks[gpu_block_id]
                     if gpu_block.is_null:
                         advanced_per_group[g] += 1
@@ -644,6 +810,11 @@ class SimpleCPUOffloadScheduler:
 
                     gpu_block_ids.append(gpu_block_id)
                     block_hashes_to_store.append(bhash_with_group)
+                    # Depth = block index within this group's portion of
+                    # the request. For the FA group this maps to token
+                    # offset / FA_block_size; for sharded groups it tracks
+                    # the same logical position.
+                    depths_to_record.append(already_stored_g + i)
                     advanced_per_group[g] += 1
 
                 if out_of_space:
@@ -652,10 +823,20 @@ class SimpleCPUOffloadScheduler:
             # --- Phase 2: Batch allocate CPU blocks and stamp hashes ---
             n_to_alloc = len(gpu_block_ids)
             if n_to_alloc > 0:
+                # SM70 fork (Phase E.3b): hoist low-score victims to the
+                # head of the free queue so they're popped first by
+                # get_new_blocks (replaces pure LRU with FLOP-aware order).
+                self._hoist_victims_to_head(n_to_alloc)
                 cpu_blocks_alloc = cpu_block_pool.get_new_blocks(n_to_alloc)
                 cpu_block_ids = [blk.block_id for blk in cpu_blocks_alloc]
                 for cpu_blk, bhash in zip(cpu_blocks_alloc, block_hashes_to_store):
                     cpu_blk._block_hash = bhash  # type: ignore[assignment]
+                # Record depths for FLOP-aware scoring on future evictions.
+                if self._eviction_policy is not None:
+                    for cpu_blk, depth in zip(cpu_blocks_alloc, depths_to_record):
+                        self._eviction_policy.record_store(
+                            cpu_blk.block_id, depth
+                        )
             else:
                 cpu_block_ids = []
 
@@ -693,6 +874,14 @@ class SimpleCPUOffloadScheduler:
                     admit_delta, reject_delta,
                     self._admission_tracker.stats(),
                 )
+
+        # SM70 fork (Phase E.3b): log eviction stats when this call hoisted
+        # at least one victim. Quiet otherwise to avoid noise.
+        if self._eviction_policy is not None and merged_cpu_block_ids:
+            logger.info(
+                "Marconi eviction: stats=%s",
+                self._eviction_policy.stats(),
+            )
 
         return merged_gpu_block_ids, merged_cpu_block_ids, req_ids
 
