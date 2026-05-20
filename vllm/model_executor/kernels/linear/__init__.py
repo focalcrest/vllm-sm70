@@ -51,6 +51,9 @@ from vllm.model_executor.kernels.linear.mixed_precision.machete import (
 from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
     MarlinLinearKernel,
 )
+from vllm.model_executor.kernels.linear.mixed_precision.sm70_turbomind import (
+    SM70TurboMindLinearKernel,
+)
 from vllm.model_executor.kernels.linear.mixed_precision.triton_w4a16 import (
     TritonW4A16LinearKernel,
 )
@@ -219,6 +222,7 @@ _POSSIBLE_WFP8A16_KERNELS: dict[PlatformEnum, list[type[FP8ScaledMMLinearKernel]
 # in priority/performance order (when available)
 _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
     PlatformEnum.CUDA: [
+        SM70TurboMindLinearKernel,
         CutlassW4A8LinearKernel,
         MacheteLinearKernel,
         AllSparkLinearKernel,

@@ -815,12 +815,18 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Will be empty for models with only sparsity
         if self.target_scheme_map:
-            matched_target = find_matched_target(
-                layer_name=layer_name,
-                module=layer,
-                targets=self.target_scheme_map.keys(),
-                fused_mapping=self.packed_modules_mapping,
-            )
+            try:
+                matched_target = find_matched_target(
+                    layer_name=layer_name,
+                    module=layer,
+                    targets=self.target_scheme_map.keys(),
+                    fused_mapping=self.packed_modules_mapping,
+                )
+            except ValueError:
+                # No matched quantization target — typically a visual-encoder
+                # layer in a multimodal model (e.g. Qwen3.6) that isn't
+                # included in the quantization recipe. Skip quantization.
+                return None
             scheme_dict = self.target_scheme_map[matched_target]
             if scheme_dict.get("format") is None:
                 scheme_dict["format"] = self.quant_format

@@ -77,8 +77,8 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # Turing and up
-        return 75
+        # SM70 (V100) is supported via SM70TurboMindLinearKernel.
+        return 70
 
     def create_weights(
         self,
