@@ -10,9 +10,10 @@ Registry::Registry(std::shared_ptr<cudaDeviceProp> device_prop):
     device_prop_{std::move(device_prop)}, arch_{device_prop_->major * 100 + device_prop_->minor * 10}
 {
     // Register the V100 kernels we actually use in this build:
-    // AWQ uint4 and dense fp16 Tensor Core paths.
+    // AWQ uint4, dense fp16, and W8A16 asymmetric Tensor Core paths.
     sm70_884_4();
     sm70_884_16();
+    sm70_884_u8a();
 }
 
 bool Registry::Add(std::unique_ptr<Kernel> kernel)
