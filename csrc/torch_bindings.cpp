@@ -283,6 +283,17 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int k_ld, bool gated_silu) -> ()");
   ops.impl("sm70_f16_gemm_out", torch::kCUDA, &sm70_f16_gemm_out);
 
+  ops.def(
+      "w8a16_sm70a_prepare(Tensor weight_int8, Tensor scales, Tensor zeros, "
+      "int group_size) -> Tensor[]");
+  ops.impl("w8a16_sm70a_prepare", torch::kCUDA, &w8a16_sm70a_prepare);
+
+  ops.def(
+      "w8a16_sm70a_gemm_out(Tensor(a!) out, Tensor in_feats, Tensor tm_weight, "
+      "Tensor tm_scales, int group_size, int k_ld, int q_ld, int n, "
+      "bool gated_silu) -> ()");
+  ops.impl("w8a16_sm70a_gemm_out", torch::kCUDA, &w8a16_sm70a_gemm_out);
+
   ops.def("sm70_gemm_import_cache(Tensor device_hint, str path) -> int");
   ops.impl("sm70_gemm_import_cache", torch::kCUDA, &sm70_gemm_import_cache);
 

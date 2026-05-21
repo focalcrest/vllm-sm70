@@ -62,6 +62,17 @@ void sm70_f16_gate_mul_out(torch::Tensor, torch::Tensor, torch::Tensor) {
   awq_sm70_unavailable();
 }
 
+std::vector<torch::Tensor> w8a16_sm70a_prepare(torch::Tensor, torch::Tensor,
+                                                torch::Tensor, int64_t) {
+  awq_sm70_unavailable();
+}
+
+void w8a16_sm70a_gemm_out(torch::Tensor, torch::Tensor, torch::Tensor,
+                          torch::Tensor, int64_t, int64_t, int64_t, int64_t,
+                          bool) {
+  awq_sm70_unavailable();
+}
+
 int64_t sm70_gemm_import_cache(torch::Tensor, const std::string&) {
   awq_sm70_unavailable();
 }

@@ -798,6 +798,87 @@ def awq_gemm_sm70_out(
     )
 
 
+def w8a16_sm70a_prepare(
+    weight_int8: torch.Tensor,
+    scales: torch.Tensor,
+    zeros: torch.Tensor,
+    group_size: int,
+) -> list[torch.Tensor]:
+    """W8A16 asymmetric prepare for SM70 (V100) TurboMind kernel.
+
+    Args:
+        weight_int8: int8 [N, K] — signed weights = uint8 - 128.
+        scales: fp16 [num_groups, N].
+        zeros: fp16 [num_groups, N] — signed zero-point = (zp_uint8 - 128)
+            cast to fp16. The bias inside the kernel is computed as
+            ``-zeros * scales``, so passing the signed zp makes
+            ``(q - zp) * scale`` numerically exact after the int8→fp16 cast.
+        group_size: per-group quant width (K / num_groups).
+
+    Returns:
+        [tm_weight (int32 [K, N/4]), tm_scales (int32 [num_groups, N]),
+         meta (int64 [2] = [k_ld, q_ld])].
+    """
+    return torch.ops._C.w8a16_sm70a_prepare(
+        weight_int8, scales, zeros, group_size
+    )
+
+
+if hasattr(torch.ops._C, "w8a16_sm70a_prepare"):
+
+    @register_fake("_C::w8a16_sm70a_prepare")
+    def _w8a16_sm70a_prepare_fake(
+        weight_int8: torch.Tensor,
+        scales: torch.Tensor,
+        zeros: torch.Tensor,
+        group_size: int,
+    ) -> list[torch.Tensor]:
+        n = weight_int8.size(0)
+        k = weight_int8.size(1)
+        num_groups = scales.size(0)
+        tm_weight = torch.empty(
+            (k, n // 4), dtype=torch.int32, device=weight_int8.device
+        )
+        tm_scales = torch.empty(
+            (num_groups, n), dtype=torch.int32, device=weight_int8.device
+        )
+        meta = torch.empty((2,), dtype=torch.int64, device=weight_int8.device)
+        return [tm_weight, tm_scales, meta]
+
+
+def w8a16_sm70a_gemm_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    tm_weight: torch.Tensor,
+    tm_scales: torch.Tensor,
+    group_size: int,
+    k_ld: int,
+    q_ld: int,
+    n: int,
+    gated_silu: bool = False,
+) -> None:
+    torch.ops._C.w8a16_sm70a_gemm_out(
+        out, input, tm_weight, tm_scales, group_size, k_ld, q_ld, n, gated_silu
+    )
+
+
+if hasattr(torch.ops._C, "w8a16_sm70a_gemm_out"):
+
+    @register_fake("_C::w8a16_sm70a_gemm_out")
+    def _w8a16_sm70a_gemm_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        tm_weight: torch.Tensor,
+        tm_scales: torch.Tensor,
+        group_size: int,
+        k_ld: int,
+        q_ld: int,
+        n: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
 def sm70_gemm_import_cache(device_hint: torch.Tensor, path: str) -> int:
     return torch.ops._C.sm70_gemm_import_cache(device_hint, path)
 
