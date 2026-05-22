@@ -48,6 +48,17 @@ logger = init_logger(__name__)
 SM70_F16_DENSE_ENABLED = (
     os.getenv("VLLM_SM70_ENABLE_DENSE_F16_FASTPATH", "0") == "1"
 )
+# When the FP16 fastpath is enabled, by default the original weight is kept
+# so the `M <= SM70_F16_DENSE_MAX_M` gate in `maybe_sm70_projection` can fall
+# back to cublas gemv for large-M prefill (where turbomind FP16 is slower).
+# Setting this env var also empties layer.weight (same trick the LM head
+# fastpath uses) so the M-gate is irrelevant — torch.compile then bakes the
+# turbomind FP16 path into the cudagraph at every M, giving a decode win
+# (+3% on W8 asym at TP=4 b=1) at the cost of a prefill regression
+# (~5% at TP=4 input=1024). Use for decode-dominated workloads only.
+SM70_F16_DENSE_FORCE_DECODE = (
+    os.getenv("VLLM_SM70_FASTPATH_FORCE_DECODE", "0") == "1"
+)
 SM70_F16_DENSE_MAX_M = int(os.getenv("VLLM_SM70_F16_DENSE_MAX_M", "64"))
 SM70_F16_DENSE_DEBUG = os.getenv("VLLM_SM70_F16_DENSE_DEBUG", "0") == "1"
 SM70_UNQUANT_DEBUG = os.getenv("VLLM_SM70_UNQUANT_DEBUG", "0") == "1"
@@ -255,6 +266,16 @@ class UnquantizedLinearMethod(LinearMethodBase):
         layer._sm70_f16_tm_weight = prepared[0]
         layer._sm70_f16_k_ld = int(prepared[1][0].item())
         layer._sm70_f16_prepared = True
+        if SM70_F16_DENSE_FORCE_DECODE:
+            # Empty the original weight tensor — same trick the LM head
+            # fastpath uses (vocab_parallel_embedding.py:108). Without this,
+            # `maybe_sm70_projection`'s `M <= 64 or not has_original_weight`
+            # gate fires False during torch.compile tracing in profile_run /
+            # _dummy_run (M is large there), so cudagraph bakes in the
+            # cublas-gemv fallback and the TM fast path never runs at
+            # decode. Emptying layer.weight forces the TM path at all M:
+            # wins ~3% on decode, costs ~5% on prefill.
+            layer.weight.data = torch.empty(0, dtype=layer.weight.dtype)
         logger.info_once("SM70 dense fp16 fast path enabled.")
 
     def apply(
