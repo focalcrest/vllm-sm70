@@ -397,6 +397,187 @@ def flash_attn_decode_paged(
     return out_tensors[0]
 
 
+# ---------------------------------------------------------------------------
+# Two-stage partitioned decode (ported from 1Cat-vLLM flash-attention-v100)
+# ---------------------------------------------------------------------------
+
+_partitioned_decode_mod = None
+_partitioned_decode_workspace_cache: dict = {}
+
+DEFAULT_PARTITION_SIZE = 256
+LONG_CONTEXT_PARTITION_SIZE = 512
+LONG_CONTEXT_PARTITION_THRESHOLD = 20480
+
+
+def _get_partitioned_decode_mod():
+    """JIT-compile the two-stage partitioned decode CUDA extension on first use."""
+    global _partitioned_decode_mod
+    if _partitioned_decode_mod is not None:
+        return _partitioned_decode_mod
+
+    import logging
+    logger = logging.getLogger(__name__)
+
+    csrc_dir = os.path.join(os.path.dirname(__file__), "csrc")
+    sources = [
+        os.path.join(csrc_dir, "decode_paged_api.cpp"),
+        os.path.join(csrc_dir, "flash_decode_paged.cu"),
+    ]
+    for src in sources:
+        if not os.path.exists(src):
+            logger.warning("Partitioned decode source not found: %s", src)
+            return None
+
+    try:
+        from torch.utils.cpp_extension import load
+        logger.info("JIT-compiling partitioned decode kernel for SM70...")
+        _partitioned_decode_mod = load(
+            name="flash_decode_paged_sm70",
+            sources=sources,
+            extra_include_paths=[csrc_dir],
+            extra_cuda_cflags=[
+                "-gencode", "arch=compute_70,code=sm_70",
+                "-U__CUDA_NO_HALF_OPERATORS__",
+                "-U__CUDA_NO_HALF_CONVERSIONS__",
+                "-U__CUDA_NO_HALF2_OPERATORS__",
+                "--use_fast_math",
+                "--expt-relaxed-constexpr",
+                "-O3",
+            ],
+            verbose=False,
+        )
+        logger.info("Partitioned decode kernel compiled successfully.")
+        return _partitioned_decode_mod
+    except Exception as e:
+        logger.warning("Failed to compile partitioned decode kernel: %s", e)
+        return None
+
+
+def _get_partition_size(max_seq_capacity: int) -> int:
+    raw = os.environ.get("VLLM_SM70_DECODE_PARTITION_SIZE")
+    if raw is not None:
+        value = int(raw)
+        if value in (256, 512, 1024):
+            return value
+    if max_seq_capacity > LONG_CONTEXT_PARTITION_THRESHOLD:
+        return LONG_CONTEXT_PARTITION_SIZE
+    return DEFAULT_PARTITION_SIZE
+
+
+def _get_partitioned_workspace(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: torch.Tensor,
+):
+    batch_capacity = block_table.shape[0]
+    num_heads = q.shape[1]
+    head_dim = q.shape[2]
+    max_seq_capacity = block_table.shape[1] * k_cache.shape[1]
+    partition_size = _get_partition_size(max_seq_capacity)
+    max_num_partitions = (max_seq_capacity + partition_size - 1) // partition_size
+    device_index = q.device.index if q.device.index is not None else -1
+    key = (device_index, batch_capacity, num_heads, head_dim,
+           max_num_partitions, partition_size)
+
+    workspace = _partitioned_decode_workspace_cache.get(key)
+    if workspace is None:
+        workspace = (
+            torch.empty(
+                (batch_capacity, num_heads, max_num_partitions, head_dim),
+                dtype=torch.float16, device=q.device,
+            ),
+            torch.empty(
+                (batch_capacity, num_heads, max_num_partitions),
+                dtype=torch.float32, device=q.device,
+            ),
+            torch.empty(
+                (batch_capacity, num_heads, max_num_partitions),
+                dtype=torch.float32, device=q.device,
+            ),
+        )
+        _partitioned_decode_workspace_cache[key] = workspace
+
+    return workspace, partition_size
+
+
+def flash_attn_decode_partitioned(
+    q,
+    k_cache,
+    v_cache,
+    block_table,
+    seq_lens,
+    *,
+    out=None,
+    softmax_scale=None,
+    kv_cache_dtype="auto",
+    k_scale=1.0,
+    v_scale=1.0,
+):
+    """Two-stage partitioned decode attention for SM70 (V100).
+
+    Splits the KV cache into fixed-size partitions (256 or 512 tokens),
+    computes attention per partition independently, then reduces via online
+    softmax. Much higher SM occupancy than FA2's split-K at long contexts.
+
+    Args:
+        q: [B, H, D] query tensor (fp16).
+        k_cache: [num_blocks, block_size, H_kv, D] paged key cache.
+        v_cache: [num_blocks, block_size, H_kv, D] paged value cache.
+        block_table: [B, max_num_blocks] int32 block table.
+        seq_lens: [B] int32 sequence lengths.
+        out: Optional output tensor [B, H, D].
+        softmax_scale: Attention scale (default: 1/sqrt(D)).
+    """
+    mod = _get_partitioned_decode_mod()
+    if mod is None:
+        raise RuntimeError("Partitioned decode kernel not available")
+
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    q = maybe_contiguous(q)
+    block_table = _maybe_int32_contiguous(block_table)
+    seq_lens = _maybe_int32_contiguous(seq_lens)
+
+    # q must be 3D [B, H, D]
+    if q.dim() == 4:
+        # [B, 1, H, D] → [B, H, D]
+        q = q.squeeze(1)
+    assert q.dim() == 3, f"Expected q [B, H, D], got {q.shape}"
+
+    if out is not None:
+        out = maybe_contiguous(out)
+        if out.dim() == 2:
+            out = out.view(q.shape[0], q.shape[1], q.shape[2])
+        elif out.dim() == 4:
+            out = out.squeeze(1)
+
+    (tmp_out, max_logits, exp_sums), partition_size = \
+        _get_partitioned_workspace(q, k_cache, block_table)
+
+    out_opt = out  # type: ignore[assignment]
+    result = mod.decode_paged_fwd(
+        q,
+        k_cache,
+        v_cache,
+        out_opt,
+        block_table,
+        seq_lens,
+        tmp_out,
+        max_logits,
+        exp_sums,
+        softmax_scale,
+        partition_size,
+        kv_cache_dtype,
+        float(k_scale),
+        float(v_scale),
+    )
+
+    if out is not None:
+        return out
+    return result
+
+
 def flash_attn_prefill_paged(
     q,
     kv_cache,

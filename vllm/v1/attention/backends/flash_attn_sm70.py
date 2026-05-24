@@ -34,6 +34,7 @@ logger = init_logger(__name__)
 # Lazy imports: only resolve optional CUDA extensions when needed.
 _flash_attn_func = None
 _flash_attn_decode_paged = None
+_flash_attn_decode_partitioned = None
 _flash_attn_prefill_paged = None
 _warned_prefill_fallback = False
 _warned_feature_fallback = False
@@ -48,23 +49,26 @@ _logged_decode_flash = False
 
 def _get_flash_ops():
     """Lazy-load package-local SM70 flash-attn ops if available."""
-    global _flash_attn_func, _flash_attn_decode_paged, _flash_attn_prefill_paged
+    global _flash_attn_func, _flash_attn_decode_paged, _flash_attn_decode_partitioned, _flash_attn_prefill_paged
     if _flash_attn_func is None or _flash_attn_decode_paged is None:
         try:
             from vllm.vllm_flash_attn_sm70 import (  # type: ignore[attr-defined]
                 flash_attn_decode_paged,
+                flash_attn_decode_partitioned,
                 flash_attn_func,
                 flash_attn_prefill_paged,
             )
         except ImportError:
             _flash_attn_func = None
             _flash_attn_decode_paged = None
+            _flash_attn_decode_partitioned = None
             _flash_attn_prefill_paged = None
         else:
             _flash_attn_func = flash_attn_func
             _flash_attn_decode_paged = flash_attn_decode_paged
+            _flash_attn_decode_partitioned = flash_attn_decode_partitioned
             _flash_attn_prefill_paged = flash_attn_prefill_paged
-    return _flash_attn_func, _flash_attn_decode_paged, _flash_attn_prefill_paged
+    return _flash_attn_func, _flash_attn_decode_paged, _flash_attn_decode_partitioned, _flash_attn_prefill_paged
 
 
 def _has_prefix_context(attn_metadata: TritonAttentionMetadata) -> bool:
@@ -113,12 +117,26 @@ class FlashAttnSM70MetadataBuilder(TritonAttentionMetadataBuilder):
 
 
 class FlashAttnSM70Impl(TritonAttentionImpl):
+    # Minimum sequence length to use the partitioned decode kernel.
+    # Below this threshold, FA2's fwd_kvcache with num_splits=4 is faster.
+    _PARTITIONED_DECODE_THRESHOLD = int(
+        os.environ.get("VLLM_SM70_PARTITIONED_DECODE_THRESHOLD", "1024")
+    )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.flash_attn_func, self.flash_attn_decode_paged, self.flash_attn_prefill_paged = _get_flash_ops()
+        (self.flash_attn_func, self.flash_attn_decode_paged,
+         self.flash_attn_decode_partitioned,
+         self.flash_attn_prefill_paged) = _get_flash_ops()
         self.use_flash_v100 = self.flash_attn_func is not None
         self.use_flash_v100_decode = self.flash_attn_decode_paged is not None
         self.use_flash_v100_prefill_paged = self.flash_attn_prefill_paged is not None
+        # Partitioned decode: enabled by default, JIT-compiled on first use.
+        # Disable with VLLM_SM70_PARTITIONED_DECODE=0.
+        self.use_partitioned_decode = (
+            os.environ.get("VLLM_SM70_PARTITIONED_DECODE", "1") != "0"
+            and self.flash_attn_decode_partitioned is not None
+        )
         self._decode_cache_k: torch.Tensor | None = None
         self._decode_cache_v: torch.Tensor | None = None
         self._decode_cache_len = 0
@@ -790,6 +808,29 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
             key_cache, value_cache = kv_cache.unbind(0)
         else:
             key_cache, value_cache = kv_cache.unbind(1)
+
+        # Use partitioned decode for long contexts (higher SM occupancy on V100)
+        if self.use_partitioned_decode:
+            max_seq_len = int(attn_metadata.seq_lens.max().item())
+            if max_seq_len > self._PARTITIONED_DECODE_THRESHOLD:
+                try:
+                    self.flash_attn_decode_partitioned(
+                        query,
+                        key_cache,
+                        value_cache,
+                        attn_metadata.block_table,
+                        attn_metadata.seq_lens,
+                        softmax_scale=self.scale,
+                        out=out_view,
+                    )
+                    return output
+                except (RuntimeError, ValueError) as e:
+                    logger.warning(
+                        "Partitioned decode failed (%s: %s); "
+                        "falling back to FA2 fwd_kvcache.",
+                        type(e).__name__, e,
+                    )
+                    self.use_partitioned_decode = False
 
         self.flash_attn_decode_paged(
             query,
