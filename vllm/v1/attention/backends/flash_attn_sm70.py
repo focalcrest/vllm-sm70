@@ -811,8 +811,7 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
 
         # Use partitioned decode for long contexts (higher SM occupancy on V100)
         if self.use_partitioned_decode:
-            max_seq_len = int(attn_metadata.seq_lens.max().item())
-            if max_seq_len > self._PARTITIONED_DECODE_THRESHOLD:
+            if attn_metadata.max_seq_len > self._PARTITIONED_DECODE_THRESHOLD:
                 try:
                     self.flash_attn_decode_partitioned(
                         query,
