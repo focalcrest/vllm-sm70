@@ -266,6 +266,7 @@ class SM70TurboMindLinearKernel(MPLinearKernel):
         layer._awq_sm70_q_ld = int(meta[1])
         layer._awq_sm70_n_orig = n
         layer._sm70_w_bits = w_bits
+        layer._awq_sm70_prepared = True
 
         for name in (self.w_q_name, self.w_s_name, self.w_zp_name):
             if not name:
