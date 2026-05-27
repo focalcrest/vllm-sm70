@@ -131,6 +131,10 @@ def _iter_unique_dense_layers(model: torch.nn.Module) -> Iterable[torch.nn.Modul
     for layer in model.modules():
         if not getattr(layer, "_awq_sm70_prepared", False):
             continue
+        # Only warm up W4 AWQ layers; W8 layers use a different kernel
+        # (w8a16_sm70a) with incompatible scale layout.
+        if getattr(layer, "_sm70_w_bits", 4) != 4:
+            continue
         k_dim = int(layer._awq_sm70_weight.shape[0])
         n_dim = int(layer._awq_sm70_weight.shape[1] * 8)
         group_size = _group_size_from_tm_scales(k_dim, layer._awq_sm70_scales)
