@@ -809,27 +809,39 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         else:
             key_cache, value_cache = kv_cache.unbind(1)
 
-        # Use partitioned decode for long contexts (higher SM occupancy on V100)
+        # Use partitioned decode unconditionally when enabled — the threshold
+        # check was removed because cudagraph FULL capture freezes the branch
+        # taken during capture (short seq_len → FA2), preventing the
+        # partitioned path from ever running at replay time.  The partitioned
+        # kernel handles short contexts fine (1 partition ≈ FA2 cost).
+        #
+        # max_seq_capacity is derived from the block_table column count
+        # (which is fixed at cdiv(max_model_len, block_size) in vLLM v1)
+        # times the block size.  Passing it explicitly ensures the workspace
+        # and CUDA grid are always sized for the worst case, so cudagraph
+        # captures a grid that works for any seq_len.
         if self.use_partitioned_decode:
-            if attn_metadata.max_seq_len > self._PARTITIONED_DECODE_THRESHOLD:
-                try:
-                    self.flash_attn_decode_partitioned(
-                        query,
-                        key_cache,
-                        value_cache,
-                        attn_metadata.block_table,
-                        attn_metadata.seq_lens,
-                        softmax_scale=self.scale,
-                        out=out_view,
-                    )
-                    return output
-                except (RuntimeError, ValueError) as e:
-                    logger.warning(
-                        "Partitioned decode failed (%s: %s); "
-                        "falling back to FA2 fwd_kvcache.",
-                        type(e).__name__, e,
-                    )
-                    self.use_partitioned_decode = False
+            max_seq_capacity = (attn_metadata.block_table.shape[1]
+                                * key_cache.shape[1])
+            try:
+                self.flash_attn_decode_partitioned(
+                    query,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.block_table,
+                    attn_metadata.seq_lens,
+                    softmax_scale=self.scale,
+                    out=out_view,
+                    max_seq_capacity=max_seq_capacity,
+                )
+                return output
+            except (RuntimeError, ValueError) as e:
+                logger.warning(
+                    "Partitioned decode failed (%s: %s); "
+                    "falling back to FA2 fwd_kvcache.",
+                    type(e).__name__, e,
+                )
+                self.use_partitioned_decode = False
 
         self.flash_attn_decode_paged(
             query,

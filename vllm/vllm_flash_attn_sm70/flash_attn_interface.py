@@ -468,11 +468,16 @@ def _get_partitioned_workspace(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     block_table: torch.Tensor,
+    max_seq_capacity: int = 0,
 ):
     batch_capacity = block_table.shape[0]
     num_heads = q.shape[1]
     head_dim = q.shape[2]
-    max_seq_capacity = block_table.shape[1] * k_cache.shape[1]
+    derived_capacity = block_table.shape[1] * k_cache.shape[1]
+    # Use the larger of the override and derived value so the workspace
+    # (and therefore the CUDA grid) is big enough for any future seq_len.
+    # Critical for cudagraph: the grid is frozen at capture time.
+    max_seq_capacity = max(max_seq_capacity, derived_capacity)
     partition_size = _get_partition_size(max_seq_capacity)
     max_num_partitions = (max_seq_capacity + partition_size - 1) // partition_size
     device_index = q.device.index if q.device.index is not None else -1
@@ -512,6 +517,7 @@ def flash_attn_decode_partitioned(
     kv_cache_dtype="auto",
     k_scale=1.0,
     v_scale=1.0,
+    max_seq_capacity=0,
 ):
     """Two-stage partitioned decode attention for SM70 (V100).
 
@@ -553,7 +559,7 @@ def flash_attn_decode_partitioned(
             out = out.squeeze(1)
 
     (tmp_out, max_logits, exp_sums), partition_size = \
-        _get_partitioned_workspace(q, k_cache, block_table)
+        _get_partitioned_workspace(q, k_cache, block_table, max_seq_capacity)
 
     out_opt = out  # type: ignore[assignment]
     result = mod.decode_paged_fwd(
