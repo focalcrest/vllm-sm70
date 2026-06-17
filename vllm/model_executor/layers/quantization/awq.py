@@ -10,7 +10,7 @@ from transformers import PretrainedConfig
 from vllm import _custom_ops as ops
 from vllm import envs
 from vllm.logger import init_logger
-from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.linear import (
     LinearBase,
     LinearMethodBase,
@@ -114,7 +114,7 @@ class AWQConfig(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
             return AWQLinearMethod(self)
-        elif isinstance(layer, FusedMoE):
+        elif isinstance(layer, RoutedExperts):
             # SM70 (V100): use TurboMind GEMM kernels for MoE,
             # since Marlin requires SM75+.
             if self._is_sm70_available():

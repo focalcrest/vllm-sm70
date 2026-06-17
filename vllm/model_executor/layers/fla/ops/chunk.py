@@ -33,6 +33,7 @@ def chunk_gated_delta_rule_fwd(
     chunk_indices: torch.Tensor | None = None,
     chunk_offsets: torch.Tensor | None = None,
     chunk_size: int = 0,
+    core_attn_out: torch.Tensor | None = None,
 ):
     if chunk_size <= 0:
         chunk_size = FLA_GDN_CHUNK_SIZE
@@ -83,6 +84,7 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         chunk_size=chunk_size,
+        core_attn_out=core_attn_out,
     )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
@@ -109,6 +111,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         chunk_offsets: torch.Tensor | None = None,
         use_qk_l2norm_in_kernel: bool = False,
         chunk_size: int = 0,
+        core_attn_out: torch.Tensor | None = None,
     ):
         if use_qk_l2norm_in_kernel:
             q = l2norm_fwd(q)
@@ -127,9 +130,15 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
             chunk_size=chunk_size,
+            core_attn_out=core_attn_out,
         )
         ctx.scale = scale
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
+        if core_attn_out is not None:
+            assert not torch.is_grad_enabled(), (
+                "core_attn_out buffer reuse is only supported for inference"
+            )
+            assert q.dtype == o.dtype, "Incompatible dtype for inplace computation"
         return o.to(q.dtype), final_state
 
 
@@ -148,6 +157,7 @@ def chunk_gated_delta_rule(
     chunk_offsets: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     chunk_size: int = 0,
+    core_attn_out: torch.Tensor | None = None,
 ):
     r"""
     Args:
@@ -240,5 +250,6 @@ def chunk_gated_delta_rule(
         chunk_offsets,
         use_qk_l2norm_in_kernel,
         chunk_size,
+        core_attn_out,
     )
     return o, final_state

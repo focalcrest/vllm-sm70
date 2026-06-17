@@ -48,19 +48,25 @@ class TurboQuantConfig:
     Applies Hadamard rotation followed by per-coordinate Lloyd-Max scalar
     quantization for keys, and uniform quantization for values.
 
-    Historical note: this is the scalar case of the HIGGS quantization
-    method (Malinovskii et al., "Pushing the Limits of Large Language Model
-    Quantization via the Linearity Theorem", NAACL 2025; preprint
-    arXiv:2411.17525): rotation + optimized grid + optional re-normalization,
-    applied to KV cache compression. A first application of this approach to
-    KV-cache compression is in "Cache Me If You Must: Adaptive Key-Value
-    Quantization for Large Language Models" (Shutova et al., ICML 2025;
-    preprint arXiv:2501.19392). Both these references pre-date the
-    TurboQuant paper.
+    Historical note: the core algorithmic pattern implemented for key
+    quantization (Hadamard rotation followed by deterministic scalar
+    quantization and re-normalization) was originally established in DRIVE
+    (Vargaftik et al., NeurIPS 2021) and EDEN (Vargaftik et al., ICML
+    2022). This formulation is also mathematically equivalent to the
+    scalar case of the HIGGS quantization method (Malinovskii et al.,
+    "Pushing the Limits of Large Language Model Quantization via the
+    Linearity Theorem", NAACL 2025; preprint arXiv:2411.17525), which
+    subsequently generalized these concepts.
 
-    QJL is intentionally omitted — community consensus (5+ independent
-    groups) found it hurts attention quality by amplifying variance through
-    softmax.
+    A first application of this approach to KV-cache compression is in
+    "Cache Me If You Must: Adaptive Key-Value Quantization for Large
+    Language Models" (Shutova et al., ICML 2025; preprint
+    arXiv:2501.19392). All of these foundational and application
+    references pre-date the TurboQuant paper (Zandieh et al., ICLR 2026).
+
+    QJL is intentionally omitted: community consensus (5+ independent
+    groups) found it hurts attention quality by amplifying variance
+    through softmax.
 
     Named presets (use via --kv-cache-dtype):
         turboquant_k8v4:   FP8 keys + 4-bit values, 2.6x, +1.17% PPL
@@ -177,7 +183,7 @@ class TurboQuantConfig:
         For hybrid models (attention + Mamba/linear-attention), boundary
         protection is disabled — hybrids typically have only 8-12
         full-attention layers and a hard n=2 on each side would cover
-        ~40% of them. The dense GSM8K baselines that motivate n=2
+        ~40 % of them.  The dense GSM8K baselines that motivate n=2
         don't apply to hybrids.
 
         For dense models, skips first N and last N attention layers.
@@ -237,15 +243,13 @@ def _get_full_attention_layer_indices(model_config: ModelConfig) -> list[int]:
     layer_types = getattr(text_cfg, "layer_types", None)
     if layer_types is not None:
         return [
-            i for i, t in enumerate(layer_types)
-            if t in ("full_attention", "attention")
+            i for i, t in enumerate(layer_types) if t in ("full_attention", "attention")
         ]
 
     layers_block_type = getattr(text_cfg, "layers_block_type", None)
     if layers_block_type is not None:
         return [
-            i for i, t in enumerate(layers_block_type)
-            if t in ("attention", "hybrid")
+            i for i, t in enumerate(layers_block_type) if t in ("attention", "hybrid")
         ]
 
     attn_type_list = getattr(hf_cfg, "attn_type_list", None)

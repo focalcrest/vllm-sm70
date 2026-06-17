@@ -27,10 +27,10 @@ from vllm.model_executor.layers.fused_moe.config import (
     RoutingMethodType,
     _get_config_dtype_str,
 )
-from vllm.model_executor.layers.fused_moe.fused_moe import *
-from vllm.model_executor.layers.fused_moe.triton_deep_gemm_moe import (
+from vllm.model_executor.layers.fused_moe.experts.triton_deep_gemm_moe import (
     TritonOrDeepGemmExperts,
 )
+from vllm.model_executor.layers.fused_moe.fused_moe import *
 from vllm.transformers_utils.config import get_config
 from vllm.triton_utils import triton
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -271,7 +271,6 @@ def benchmark_config(
                     moe_config=moe_config,
                     quant_config=quant_config,
                 ),
-                inplace=not disable_inplace(),
             )
 
         with override_config(config):
@@ -279,7 +278,6 @@ def benchmark_config(
                 x, input_gating, topk, renormalize=not use_deep_gemm
             )
 
-            inplace = not disable_inplace()
             if use_deep_gemm:
                 return deep_gemm_experts.apply(
                     x,
@@ -298,7 +296,6 @@ def benchmark_config(
                 w2,
                 topk_weights,
                 topk_ids,
-                inplace=inplace,
                 quant_config=quant_config,
             )
 

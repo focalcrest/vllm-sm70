@@ -20,7 +20,10 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -189,7 +192,6 @@ class MLPBlock(torch.nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            reduce_results=True,
             renormalize=True,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
@@ -332,7 +334,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
         # Params for weights, weight scales, activation scales
         # (param_name, weight_name, expert_id, shard_id)
         # NOTE: this is only used for quark.
-        return FusedMoE.make_expert_params_mapping(
+        return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
@@ -632,52 +634,6 @@ class GptOssModel(nn.Module, EagleModelMixin):
                     )
 
                 moe_quant_method = _get_moe_weight_dtype(layer_id=layer_id)
-
-            def kv_cache_scale_loader(
-                quant_config: QuantizationConfig,
-                name: str,
-                params_dict: dict[str, typing.Any],
-                weight: torch.Tensor,
-                default_weight_loader: Callable[..., None],
-                loaded_params: set[str],
-            ) -> tuple[bool, set[str]]:
-                """
-                Load KV cache output scales.
-                Returns:
-                    Tuple of (bool, set):
-                    - bool: True if KV-cache scale was loaded into loaded_params
-                    - set: Updated set of loaded_params if True else the original set
-                """
-                # load explicit cached KV output scale from quant_config
-                if quant_config is not None and (
-                    scale_name := quant_config.get_cache_scale(name)
-                ):
-                    param = params_dict[scale_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    if weight.numel() != 1:
-                        raise ValueError(
-                            f"KV cache scale '{scale_name}' is expected to be a "
-                            f"scalar, but got a tensor of shape {weight.shape}."
-                        )
-                    # Ensure weight is a scalar before passing to loader.
-                    weight_loader(param, weight.flatten()[0])
-                    loaded_params.add(scale_name)
-                    return True, loaded_params
-
-                return False, loaded_params
-
-            load_kv_cache_scale_completed, loaded_params = kv_cache_scale_loader(
-                self.quant_config,
-                name,
-                params_dict,
-                loaded_weight,
-                default_weight_loader,
-                loaded_params,
-            )
-            if load_kv_cache_scale_completed:
-                continue
 
             if (
                 all(key in name for key in ["input_scale", "mlp.experts"])
