@@ -29,11 +29,7 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "()");
   ops.def("permute_cols(Tensor A, Tensor perm) -> Tensor");
 
-#ifndef USE_ROCM
-
-  // TODO: Remove this once ROCm upgrade to torch 2.11.
-  ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
-#endif
+  // get_cuda_view_from_cpu_tensor moved to old-ABI _C (SM70/torch-2.10).
 
 #ifndef USE_ROCM
   // CUTLASS w8a8 GEMM, supporting symmetric per-tensor or per-row/column
@@ -677,10 +673,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 
 // TODO: Remove this once ROCm upgrade to torch 2.11.
 #ifndef USE_ROCM
-STABLE_TORCH_LIBRARY_IMPL(_C, CPU, ops) {
-  ops.impl("get_cuda_view_from_cpu_tensor",
-           TORCH_BOX(&get_cuda_view_from_cpu_tensor));
-}
+// get_cuda_view_from_cpu_tensor moved to old-ABI _C (SM70/torch-2.10).
 
 STABLE_TORCH_LIBRARY_FRAGMENT(_C_cuda_utils, cuda_utils) {
   cuda_utils.def("get_device_attribute(int attribute, int device_id) -> int");
@@ -831,7 +824,6 @@ STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CUDA, custom_ar) {
   custom_ar.impl("init_custom_ar", TORCH_BOX(&init_custom_ar));
   custom_ar.impl("init_custom_ar_hierarchical",
                  TORCH_BOX(&init_custom_ar_hierarchical));
-  custom_ar.impl("register_group_buffer", TORCH_BOX(&register_group_buffer));
   custom_ar.impl("all_reduce", TORCH_BOX(&all_reduce));
 }
 
@@ -843,6 +835,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C_custom_ar, CompositeExplicitAutograd, custom_ar) {
   custom_ar.impl("dispose", TORCH_BOX(&dispose));
   custom_ar.impl("meta_size", TORCH_BOX(&meta_size));
   custom_ar.impl("register_buffer", TORCH_BOX(&register_buffer));
+  // No tensor args (int[] are IPC pointers) -> backend-agnostic, like register_buffer.
+  custom_ar.impl("register_group_buffer", TORCH_BOX(&register_group_buffer));
   custom_ar.impl("get_graph_buffer_ipc_meta",
                  TORCH_BOX(&get_graph_buffer_ipc_meta));
   custom_ar.impl("register_graph_buffers", TORCH_BOX(&register_graph_buffers));

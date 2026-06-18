@@ -622,6 +622,9 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 
 
 
+  # SM70/torch-2.10: the stable-ABI cuda_view does not compile on torch 2.10
+  # (stable from_blob lacks a deleter); use the old-ABI impl in _C, as ROCm does.
+  list(APPEND VLLM_EXT_SRC "csrc/cuda_view.cu")
 # if CUDA endif
 endif()
 
@@ -694,7 +697,6 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
 
   if(VLLM_GPU_LANG STREQUAL "CUDA")
     list(APPEND VLLM_STABLE_EXT_SRC
-      "csrc/libtorch_stable/cuda_view.cu"
       "csrc/libtorch_stable/cuda_utils_kernels.cu"
       "csrc/libtorch_stable/cutlass_extensions/common.cpp"
       "csrc/libtorch_stable/quantization/w8a8/cutlass/scaled_mm_entry.cu"

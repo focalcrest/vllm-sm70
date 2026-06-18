@@ -108,6 +108,9 @@ torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor);
 #endif
 
 #ifndef USE_ROCM
+// SM70/torch-2.10: old-ABI cuda_view (stable from_blob on 2.10 has no deleter).
+torch::Tensor get_cuda_view_from_cpu_tensor(torch::Tensor& cpu_tensor);
+
 // SM70 (V100) TurboMind GEMM kernels — impl in csrc/quantization/awq/*sm70*.cu,
 // registered in the _C `ops` library (csrc/torch_bindings.cpp).
 std::vector<torch::Tensor> awq_sm70_prepare(torch::Tensor _kernel,

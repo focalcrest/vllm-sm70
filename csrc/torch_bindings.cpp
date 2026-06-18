@@ -32,14 +32,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("weak_ref_tensor(Tensor input) -> Tensor");
   ops.impl("weak_ref_tensor", torch::kCUDA, &weak_ref_tensor);
 
-#ifdef USE_ROCM
-  // TODO: Remove this once we upgrade to torch 2.11.
-  // ROCm still uses torch 2.10,
-  // So we still need to use unstable torch ABI for now.
+  // SM70/torch-2.10: old-ABI cuda_view in _C (stable ABI on torch 2.10 lacks a
+  // from_blob deleter). Registered for both CUDA and ROCm.
   ops.def("get_cuda_view_from_cpu_tensor(Tensor cpu_tensor) -> Tensor");
   ops.impl("get_cuda_view_from_cpu_tensor", torch::kCPU,
            &get_cuda_view_from_cpu_tensor);
-#endif
 
   // Activation ops (quantized only — basic ops moved to _C_stable_libtorch)
   ops.def(
