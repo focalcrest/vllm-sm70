@@ -93,6 +93,10 @@ class FlashAttnSM70MetadataBuilder(TritonAttentionMetadataBuilder):
         attn_metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
         attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        # DFlash routes its non-causal draft to this backend; thread the flag
+        # through so forward() (and the DFlash per-layer assert) see it.
+        # Defaults to True for the target model and all non-DFlash workloads.
+        attn_metadata.causal = getattr(common_attn_metadata, "causal", True)
         return attn_metadata
 
     @staticmethod
@@ -348,6 +352,46 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         )
         return output
 
+    def _flash_v100_noncausal(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Non-causal paged attention for the DFlash draft block.
+
+        Mirrors _flash_v100_chunked_prefill but bidirectional (causal=False):
+        each query token attends to the full (context + block) paged KV. The
+        SM70 flash op supports causal=False + block_table (cf. the cascade
+        prefix path). Sliding-window draft layers are treated as full
+        attention here, which is exact while context < window (short prompts);
+        long-context windowing would need the DFlash-SWA work (PR #40898).
+        """
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        query = query[:num_actual_tokens]
+        out_view = output[:num_actual_tokens]
+
+        if kv_cache.shape[0] == 2:
+            key_cache, value_cache = kv_cache.unbind(0)
+        else:
+            key_cache, value_cache = kv_cache.unbind(1)
+
+        self.flash_attn_func(
+            q=query,
+            k=key_cache,
+            v=value_cache,
+            out=out_view,
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            seqused_k=attn_metadata.seq_lens,
+            block_table=attn_metadata.block_table,
+            max_seqlen_q=attn_metadata.max_query_len,
+            max_seqlen_k=attn_metadata.max_seq_len,
+            softmax_scale=self.scale,
+            causal=False,
+        )
+        return output
+
     @override
     def forward(
         self,
@@ -376,6 +420,39 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
                 "'flash_attn_v100' is unavailable. Falling back to Triton."
             )
             _warned_missing_flash_ops = True
+
+        # DFlash routes its non-causal draft block to this backend. Handle it
+        # before the _supports_flash_v100_path() gate so the drafter's
+        # sliding-window layers (window >= seq for short ctx => full attention)
+        # don't bail to the causal-only Triton fallback.
+        if self.use_flash_v100 and getattr(attn_metadata, "causal", True) is False:
+            if not _logged_prefill_flash:
+                logger.info(
+                    "FLASH_ATTN_SM70 non-causal (DFlash draft) path active."
+                )
+                _logged_prefill_flash = True
+            try:
+                return self._flash_v100_noncausal(
+                    query, kv_cache, attn_metadata, output
+                )
+            except (RuntimeError, ValueError) as e:
+                logger.warning(
+                    "FLASH_ATTN_SM70 non-causal path failed (%s: %s); "
+                    "falling back to Triton.",
+                    type(e).__name__,
+                    e,
+                )
+                return super().forward(
+                    layer,
+                    query,
+                    key,
+                    value,
+                    kv_cache,
+                    attn_metadata,
+                    output,
+                    output_scale,
+                    output_block_scale,
+                )
 
         if not self._supports_flash_v100_path():
             if self.use_flash_v100 and not _warned_feature_fallback:
@@ -919,6 +996,15 @@ class FlashAttnSM70Backend(TritonAttentionBackend):
         return TritonAttentionBackend.get_kv_cache_stride_order(
             include_num_layers_dimension
         )
+
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        # The SM70 flash op supports causal=False over paged KV (see the
+        # cascade-prefix path); FlashAttnSM70Impl.forward routes non-causal
+        # metadata (e.g. the DFlash draft) through _flash_v100_noncausal. This
+        # lets the selector pick FLASH_ATTN_SM70 for DFlash's non-causal drafter
+        # instead of FlexAttention (which exceeds SM70's 96KB smem at headdim128).
+        return True
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
