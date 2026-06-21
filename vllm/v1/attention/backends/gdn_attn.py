@@ -330,7 +330,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         prefill_state_indices: torch.Tensor | None = None
         prefill_has_initial_state: torch.Tensor | None = None
         if num_prefills > 0:
-            from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
+            from vllm.model_executor.layers.fla.ops.utils import (
+                FLA_CHUNK_SIZE,
+                FLA_GDN_CHUNK_SIZE,
+            )
 
             # In a mixed non-spec batch, decodes are peeled off to the recurrent
             # kernel (decode-first front slice), so build chunk metadata from the
@@ -376,11 +379,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
                 assert prefill_query_start_loc_cpu is not None
+                # The Triton/FLA chunk_gated_delta_rule kernel tiles at
+                # FLA_GDN_CHUNK_SIZE (its default when no chunk_size is passed),
+                # NOT FLA_CHUNK_SIZE. The chunk metadata must use the same size
+                # or cross-chunk indices go out of bounds (garbage >32 tok of
+                # prefill, CUDA illegal-access at multi-chunk on SM70). The 0.23
+                # rebase wrongly switched this to FLA_CHUNK_SIZE; restore the
+                # kernel-matching size. (cutedsl/sm90 path stays FLA_CHUNK_SIZE.)
                 chunk_indices = prepare_chunk_indices(
-                    prefill_query_start_loc_cpu, FLA_CHUNK_SIZE
+                    prefill_query_start_loc_cpu, FLA_GDN_CHUNK_SIZE
                 ).to(device=gpu_device, non_blocking=True)
                 chunk_offsets = prepare_chunk_offsets(
-                    prefill_query_start_loc_cpu, FLA_CHUNK_SIZE
+                    prefill_query_start_loc_cpu, FLA_GDN_CHUNK_SIZE
                 ).to(device=gpu_device, non_blocking=True)
 
         if num_prefills > 0:
