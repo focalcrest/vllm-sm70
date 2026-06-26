@@ -36,7 +36,6 @@ _flash_attn_func = None
 _flash_attn_decode_paged = None
 _flash_attn_decode_partitioned = None
 _flash_attn_prefill_paged = None
-_warned_prefill_fallback = False
 _warned_feature_fallback = False
 _warned_decode_fallback = False
 _warned_decode_runtime_fallback = False
@@ -87,7 +86,16 @@ def _is_cascade_supported(attn_metadata: TritonAttentionMetadata) -> bool:
 
 
 class FlashAttnSM70MetadataBuilder(TritonAttentionMetadataBuilder):
-    _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+    # UNIFORM_BATCH (not UNIFORM_SINGLE_TOKEN_DECODE) so the engine does NOT
+    # downgrade FULL_AND_PIECEWISE -> PIECEWISE when speculative decoding is
+    # active. Spec-decode verify steps have query_len = 1 + num_speculative
+    # tokens (a uniform multi-token batch), which this backend captures
+    # correctly into a FULL cudagraph (validated lossless; see worklog
+    # 2026-06-25-dflash-cudagraph-uniform-batch-and-anbeeld-repro). Pairs with
+    # the removal of the is_capturing prefill->Triton fallback in forward()
+    # below, so the fast flash_attn_func (not the slow Triton fallback) is what
+    # gets captured for the verify step.
+    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build: bool = False):
         attn_metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
@@ -406,7 +414,7 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         global _logged_decode_flash, _logged_prefill_flash
-        global _warned_decode_fallback, _warned_prefill_fallback
+        global _warned_decode_fallback
         global _warned_feature_fallback, _warned_missing_flash_ops
         global _warned_gqa_fallback, _warned_prefill_runtime_fallback
 
@@ -474,7 +482,6 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
             )
 
         is_prefill = attn_metadata.max_query_len > 1
-        is_capturing = query.is_cuda and torch.cuda.is_current_stream_capturing()
 
         if is_prefill and self._is_tq_cache():
             # TQ prefill: first-chunk uses raw FP16 K/V with FA2 varlen.
@@ -509,23 +516,12 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
                     output_scale,
                     output_block_scale,
                 )
-            if is_capturing:
-                if not _warned_prefill_fallback:
-                    logger.warning(
-                        "FLASH_ATTN_SM70 prefill fallback during CUDA graph capture."
-                    )
-                    _warned_prefill_fallback = True
-                return super().forward(
-                    layer,
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata,
-                    output,
-                    output_scale,
-                    output_block_scale,
-                )
+            # NOTE: no is_capturing prefill->Triton fallback here. With
+            # _cudagraph_support = UNIFORM_BATCH (above), the spec-decode verify
+            # step (query_len = 1 + num_speculative tokens) is captured into a
+            # FULL cudagraph; flash_attn_func is cuda-graph-safe on SM70 for this
+            # path (validated lossless). Capturing the Triton fallback instead
+            # was measured ~8% slower at deep nspec / long context.
             if attn_metadata.common_prefix_len > 0 and _is_cascade_supported(
                 attn_metadata
             ):
