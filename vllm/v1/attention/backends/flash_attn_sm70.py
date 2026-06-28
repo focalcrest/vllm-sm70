@@ -360,6 +360,58 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
         )
         return output
 
+    def _flash_v100_bfla_prefill(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """BFLA sparse-prefill (single sequence, long ctx).
+
+        Gathers the sequence's paged KV into a contiguous buffer, builds the
+        BFLA block-importance mask (arXiv 2605.12193), and runs the SM70
+        block-sparse flash kernel. Gated to single-sequence prefill (the eval
+        scenario); multi-seq / chunked / prefix-cache fall through to dense.
+        """
+        from vllm.vllm_flash_attn.flash_attn_interface import sparse_attn_func
+        from vllm.v1.attention.backends.bfla_mask import build_bfla_block_mask
+
+        num_actual = attn_metadata.num_actual_tokens
+        q = query[:num_actual]                                  # [Sq, Hq, D]
+        Sq, Hq, D = q.shape
+        if kv_cache.shape[0] == 2:
+            key_cache, value_cache = kv_cache.unbind(0)
+        else:
+            key_cache, value_cache = kv_cache.unbind(1)
+        block_size, Hk = key_cache.shape[1], key_cache.shape[2]
+        seq_len = int(attn_metadata.seq_lens[0].item())
+        n_blocks = (seq_len + block_size - 1) // block_size
+        phys = attn_metadata.block_table[0, :n_blocks]
+        # gather paged KV -> contiguous [1, Sk, Hk, D]
+        k = key_cache[phys].reshape(-1, Hk, D)[:seq_len].unsqueeze(0).contiguous()
+        v = value_cache[phys].reshape(-1, Hk, D)[:seq_len].unsqueeze(0).contiguous()
+        qb = q.unsqueeze(0).contiguous()                        # [1, Sq, Hq, D]
+
+        block_m = 32 if D == 256 else 64                        # kBlockM (smem)
+        gamma = float(os.environ.get("VLLM_SM70_BFLA_GAMMA", "0.95"))
+        n_local = int(os.environ.get("VLLM_SM70_BFLA_NLOCAL", "8"))
+        bc, bo, cc, ci, _density = build_bfla_block_mask(
+            qb[0], k[0], block_m=block_m, block_n=64,
+            gamma=gamma, n_local=n_local, causal=True,
+        )
+        if os.environ.get("VLLM_SM70_BFLA_DEBUG") == "1":
+            logger.info(
+                "BFLA prefill seq_len=%d head_dim=%d gamma=%.2f density=%.3f",
+                seq_len, D, gamma, _density,
+            )
+        out = sparse_attn_func(
+            qb, k, v, bc, bo, cc, ci,
+            softmax_scale=self.scale, causal=True,
+        )
+        output[:num_actual] = out[0]
+        return output
+
     def _flash_v100_noncausal(
         self,
         query: torch.Tensor,
@@ -550,6 +602,28 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
                         output,
                         output_scale,
                         output_block_scale,
+                    )
+            # BFLA sparse-prefill gate (env VLLM_SM70_BFLA=1): single-sequence,
+            # long-ctx, head_dim 128/256. Falls back to dense on any failure.
+            if (
+                os.environ.get("VLLM_SM70_BFLA") == "1"
+                and attn_metadata.seq_lens.shape[0] == 1
+                and attn_metadata.max_seq_len
+                >= int(os.environ.get("VLLM_SM70_BFLA_MIN_LEN", "8192"))
+                and query.shape[-1] in (128, 256)
+            ):
+                self._reset_decode_cache()
+                try:
+                    if not _logged_prefill_flash:
+                        logger.info("FLASH_ATTN_SM70 BFLA sparse prefill active.")
+                        _logged_prefill_flash = True
+                    return self._flash_v100_bfla_prefill(
+                        query, kv_cache, attn_metadata, output
+                    )
+                except (RuntimeError, ValueError) as e:
+                    logger.warning(
+                        "FLASH_ATTN_SM70 BFLA prefill failed (%s: %s); "
+                        "falling back to dense.", type(e).__name__, e
                     )
             if not _logged_prefill_flash:
                 logger.info("FLASH_ATTN_SM70 prefill path active.")
