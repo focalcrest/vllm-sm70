@@ -446,11 +446,15 @@ class SimpleCPUOffloadScheduler:
             self.l2_coordinator = get_kv_cache_coordinator(
                 kv_cache_config=self.l2_kv_cache_config,
                 max_model_len=vllm_config.model_config.max_model_len,
+                max_num_batched_tokens=(
+                    vllm_config.scheduler_config.max_num_batched_tokens
+                ),
                 use_eagle=False,
                 enable_caching=True,
                 enable_kv_cache_events=False,  # L2 is internal; no events
                 dcp_world_size=dcp_world_size,
                 pcp_world_size=pcp_world_size,
+                scheduler_block_size=self.block_size,
                 hash_block_size=self.block_size,
             )
             self.l2_block_pool = self.l2_coordinator.block_pool
@@ -712,6 +716,8 @@ class SimpleCPUOffloadScheduler:
                 block_ids=tuple([] for _ in range(num_groups)),
                 num_stored_blocks=[0] * num_groups,
             )
+
+        pending = self._pending_cpu_hits.pop(req_id, None)
 
         # SM70 fork (Phase E.5b-3 / option C): the tier annotation recorded
         # by get_num_new_matched_tokens drives per-block routing below.
