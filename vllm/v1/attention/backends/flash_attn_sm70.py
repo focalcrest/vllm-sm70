@@ -607,6 +607,7 @@ class FlashAttnSM70Impl(TritonAttentionImpl):
             # long-ctx, head_dim 128/256. Falls back to dense on any failure.
             if (
                 os.environ.get("VLLM_SM70_BFLA") == "1"
+                and not torch.cuda.is_current_stream_capturing()
                 and attn_metadata.seq_lens.shape[0] == 1
                 and attn_metadata.max_seq_len
                 >= int(os.environ.get("VLLM_SM70_BFLA_MIN_LEN", "8192"))
