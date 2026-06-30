@@ -2010,6 +2010,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    # SM70 block-sparse full-attention (BFLA) prefill settings.
+    "VLLM_SM70_BFLA": lambda: os.getenv("VLLM_SM70_BFLA", "0"),
+    "VLLM_SM70_BFLA_GAMMA": lambda: os.getenv("VLLM_SM70_BFLA_GAMMA", "0.95"),
+    "VLLM_SM70_BFLA_MIN_LEN": lambda: os.getenv("VLLM_SM70_BFLA_MIN_LEN", "8192"),
+    "VLLM_SM70_BFLA_NLOCAL": lambda: os.getenv("VLLM_SM70_BFLA_NLOCAL", "8"),
+    "VLLM_SM70_BFLA_DEBUG": lambda: os.getenv("VLLM_SM70_BFLA_DEBUG", "0"),
 }
 
 
