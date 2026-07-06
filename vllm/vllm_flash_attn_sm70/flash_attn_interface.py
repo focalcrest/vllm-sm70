@@ -410,7 +410,15 @@ LONG_CONTEXT_PARTITION_THRESHOLD = 20480
 
 
 def _get_partitioned_decode_mod():
-    """JIT-compile the two-stage partitioned decode CUDA extension on first use."""
+    """Load the two-stage partitioned decode CUDA extension for SM70.
+
+    Prefers a prebuilt .so (compiled ahead-of-time on a host with nvcc — see
+    scripts/build_sm70_partitioned_decode.py, run during the wheel build) and
+    falls back to JIT-compiling from source on first use. The JIT path needs
+    nvcc at runtime, which the vllm-sm70-docker image intentionally omits
+    (nvidia/cuda:*-runtime, not *-devel); without the prebuilt .so it fails
+    silently there and every decode call falls back to the slower FA2 path.
+    """
     global _partitioned_decode_mod
     if _partitioned_decode_mod is not None:
         return _partitioned_decode_mod
@@ -427,6 +435,24 @@ def _get_partitioned_decode_mod():
         if not os.path.exists(src):
             logger.warning("Partitioned decode source not found: %s", src)
             return None
+
+    prebuilt_so = os.path.join(csrc_dir, "flash_decode_paged_sm70.so")
+    if os.path.exists(prebuilt_so):
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "flash_decode_paged_sm70", prebuilt_so
+            )
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _partitioned_decode_mod = mod
+            logger.info("Loaded prebuilt partitioned decode kernel for SM70.")
+            return _partitioned_decode_mod
+        except Exception as e:
+            logger.warning(
+                "Failed to load prebuilt partitioned decode kernel (%s: %s); "
+                "falling back to JIT compile.", type(e).__name__, e,
+            )
 
     try:
         from torch.utils.cpp_extension import load

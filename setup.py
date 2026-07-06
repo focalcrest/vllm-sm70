@@ -1139,6 +1139,11 @@ package_data = {
         "entrypoints/serve/instrumentator/static/*.js",
         "entrypoints/serve/instrumentator/static/*.css",
         "distributed/kv_transfer/kv_connector/v1/hf3fs/utils/*.cpp",
+        # Prebuilt SM70 partitioned decode kernel — see
+        # scripts/build_sm70_partitioned_decode.py. Ships a .so compiled
+        # ahead-of-time (needs nvcc) so runtime-only containers (no CUDA
+        # toolkit) don't fall back to JIT compilation, which fails there.
+        "vllm_flash_attn_sm70/csrc/*.so",
         # DeepGEMM JIT include headers (vendored via cmake)
         "third_party/deep_gemm/include/**/*.cuh",
         "third_party/deep_gemm/include/**/*.h",
