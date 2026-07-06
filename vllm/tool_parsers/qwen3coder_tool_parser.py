@@ -30,6 +30,7 @@ from vllm.tool_parsers.structural_tag_registry import (
     get_model_structural_tag,
 )
 from vllm.tool_parsers.utils import (
+    _extract_tool_info,
     coerce_to_schema_type,
     extract_types_from_schema,
     find_tool_properties,
@@ -119,6 +120,11 @@ class Qwen3CoderToolParser(ToolParser):
         # Store accumulated parameters for type conversion
         self.accumulated_params = {}
         self.streaming_request = None
+        # Text offsets of <tool_call> spans identified as calls to
+        # undeclared functions (see extract_tool_calls_streaming) — excluded
+        # from tool_start_positions so current_tool_index stays gap-free
+        # against streamed_args_for_tool / prev_tool_call_arr.
+        self.invalid_tool_start_positions: set[int] = set()
 
     def _convert_param_value(
         self, param_value: str, param_name: str, param_config: dict, func_name: str
@@ -202,23 +208,49 @@ class Qwen3CoderToolParser(ToolParser):
                 self._parse_xml_function_call(function_call_str)
                 for function_call_str in function_calls
             ]
+            valid_tool_calls = [tc for tc in tool_calls if tc is not None]
+
+            # Drop calls to functions the client never declared. Reasoning
+            # models occasionally recite the tool-call format instructions
+            # (chat_template's "<function=example_function_name>" sample)
+            # verbatim in their output; that recitation is syntactically a
+            # well-formed tool call, so without this check it gets forwarded
+            # to the client as a hallucinated call alongside the real one.
+            if self.tools:
+                known_names = {_extract_tool_info(tool)[0] for tool in self.tools}
+                dropped_names = sorted(
+                    {
+                        tc.function.name
+                        for tc in valid_tool_calls
+                        if tc.function.name not in known_names
+                    }
+                )
+                if dropped_names:
+                    logger.warning(
+                        "Dropping tool call(s) to undeclared function(s) %s "
+                        "— likely the model reciting the tool-call format "
+                        "example rather than making a real call.",
+                        dropped_names,
+                    )
+                valid_tool_calls = [
+                    tc for tc in valid_tool_calls if tc.function.name in known_names
+                ]
+
             # Populate prev_tool_call_arr for serving layer to set finish_reason
             self.prev_tool_call_arr.clear()  # Clear previous calls
-            for tool_call in tool_calls:
-                if tool_call:
-                    self.prev_tool_call_arr.append(
-                        {
-                            "name": tool_call.function.name,
-                            "arguments": tool_call.function.arguments,
-                        }
-                    )
+            for tool_call in valid_tool_calls:
+                self.prev_tool_call_arr.append(
+                    {
+                        "name": tool_call.function.name,
+                        "arguments": tool_call.function.arguments,
+                    }
+                )
 
             # Extract content before tool calls
             content_index = model_output.find(self.tool_call_start_token)
             idx = model_output.find(self.tool_call_prefix)
             content_index = content_index if content_index >= 0 else idx
             content = model_output[:content_index]  # .rstrip()
-            valid_tool_calls = [tc for tc in tool_calls if tc is not None]
             return ExtractedToolCallInformation(
                 tools_called=(len(valid_tool_calls) > 0),
                 tool_calls=valid_tool_calls,
@@ -323,26 +355,22 @@ class Qwen3CoderToolParser(ToolParser):
                 # Normal content, no tool call
                 return DeltaMessage(content=delta_text)
 
-        # Check if we're between tool calls (waiting for next one)
-        # Count tool calls we've seen vs processed
-        tool_starts_count = current_text.count(self.tool_call_start_token)
-        if self.current_tool_index >= tool_starts_count:
-            # We're past all tool calls, shouldn't be here
-            return None
-
-        # We're in a tool call, find the current tool call portion
-        # Need to find the correct tool call based on current_tool_index
+        # We're in a tool call, find the current tool call portion. Need to
+        # find the correct tool call based on current_tool_index — excludes
+        # spans already identified as calls to undeclared functions so
+        # current_tool_index stays gap-free (see below).
         tool_start_positions: list[int] = []
         idx = 0
         while True:
             idx = current_text.find(self.tool_call_start_token, idx)
             if idx == -1:
                 break
-            tool_start_positions.append(idx)
+            if idx not in self.invalid_tool_start_positions:
+                tool_start_positions.append(idx)
             idx += len(self.tool_call_start_token)
 
         if self.current_tool_index >= len(tool_start_positions):
-            # No more tool calls to process yet
+            # We're past all valid tool calls (or no more to process yet)
             return None
 
         tool_start_idx = tool_start_positions[self.current_tool_index]
@@ -366,6 +394,43 @@ class Qwen3CoderToolParser(ToolParser):
                 if func_end != -1:
                     # Found complete function name
                     self.current_function_name = tool_text[func_start:func_end]
+
+                    # Drop calls to functions the client never declared —
+                    # same reasoning as the check in extract_tool_calls().
+                    # The model sometimes recites the chat template's
+                    # literal "<function=example_function_name>" format
+                    # example verbatim; treat it as if this tool call never
+                    # started and advance to the next one (if any) without
+                    # streaming anything to the client for it.
+                    if self.tools:
+                        known_names = {
+                            _extract_tool_info(t)[0] for t in self.tools
+                        }
+                        if self.current_function_name not in known_names:
+                            logger.warning(
+                                "Dropping streamed tool call to undeclared "
+                                "function %r — likely the model reciting "
+                                "the tool-call format example rather than "
+                                "making a real call.",
+                                self.current_function_name,
+                            )
+                            # Exclude this span rather than bumping
+                            # current_tool_index — the latter would desync
+                            # it from streamed_args_for_tool/prev_tool_call_arr,
+                            # which only grow when a call is actually
+                            # accepted below. current_tool_index stays put;
+                            # the next call recomputes tool_start_positions
+                            # with this offset filtered out, so the same
+                            # index then naturally lands on whatever comes
+                            # next.
+                            self.invalid_tool_start_positions.add(tool_start_idx)
+                            remaining = [
+                                p for p in tool_start_positions if p != tool_start_idx
+                            ]
+                            if self.current_tool_index >= len(remaining):
+                                self.is_tool_call_started = False
+                            return None
+
                     self.current_tool_id = self._generate_tool_call_id()
                     self.header_sent = True
                     self.in_function = True
