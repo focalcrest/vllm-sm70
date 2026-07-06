@@ -56,6 +56,31 @@ def wrap_data_with_event(data: str, event: str):
     return f"event: {event}\ndata: {data}\n\n"
 
 
+def _split_cached_input_tokens(usage) -> tuple[int, int | None]:
+    """Split an OpenAI-style usage's total prompt_tokens into Anthropic's
+    (input_tokens, cache_read_input_tokens) convention.
+
+    Anthropic's real API reports input_tokens EXCLUDING any cache-hit
+    tokens — total prompt length = input_tokens + cache_read_input_tokens
+    (+ cache_creation_input_tokens, which vLLM doesn't track separately).
+    vLLM's usage.prompt_tokens is the TOTAL prompt length instead, so it
+    must be reduced by the cached count here or cached tokens get counted
+    twice when a client adds the two fields together.
+
+    RequestOutput.num_cached_tokens is tracked internally regardless of
+    --enable-prompt-tokens-details, but usage.prompt_tokens_details is
+    only populated when that flag is on (see OpenAIServingChat) — without
+    it this just returns (prompt_tokens, None).
+    """
+    prompt_tokens = usage.prompt_tokens if usage is not None else 0
+    cached = None
+    if usage is not None and usage.prompt_tokens_details is not None:
+        cached = usage.prompt_tokens_details.cached_tokens
+    if cached:
+        return prompt_tokens - cached, cached
+    return prompt_tokens, None
+
+
 class AnthropicServingMessages(OpenAIServingChat):
     """Handler for Anthropic Messages API requests"""
 
@@ -501,13 +526,17 @@ class AnthropicServingMessages(OpenAIServingChat):
         self,
         generator: ChatCompletionResponse,
     ) -> AnthropicMessagesResponse:
+        input_tokens, cache_read_input_tokens = _split_cached_input_tokens(
+            generator.usage
+        )
         result = AnthropicMessagesResponse(
             id=generator.id,
             content=[],
             model=generator.model,
             usage=AnthropicUsage(
-                input_tokens=generator.usage.prompt_tokens,
+                input_tokens=input_tokens,
                 output_tokens=generator.usage.completion_tokens,
+                cache_read_input_tokens=cache_read_input_tokens,
             ),
             kv_transfer_params=generator.kv_transfer_params,
         )
@@ -651,6 +680,9 @@ class AnthropicServingMessages(OpenAIServingChat):
                         )
 
                         if first_item:
+                            start_input_tokens, start_cache_read = (
+                                _split_cached_input_tokens(origin_chunk.usage)
+                            )
                             chunk = AnthropicStreamEvent(
                                 type="message_start",
                                 message=AnthropicMessagesResponse(
@@ -660,10 +692,9 @@ class AnthropicServingMessages(OpenAIServingChat):
                                     stop_reason=None,
                                     stop_sequence=None,
                                     usage=AnthropicUsage(
-                                        input_tokens=origin_chunk.usage.prompt_tokens
-                                        if origin_chunk.usage
-                                        else 0,
+                                        input_tokens=start_input_tokens,
                                         output_tokens=0,
+                                        cache_read_input_tokens=start_cache_read,
                                     ),
                                 ),
                             )
@@ -679,16 +710,18 @@ class AnthropicServingMessages(OpenAIServingChat):
                             stop_reason = self.stop_reason_map.get(
                                 finish_reason or "stop"
                             )
+                            delta_input_tokens, delta_cache_read = (
+                                _split_cached_input_tokens(origin_chunk.usage)
+                            )
                             chunk = AnthropicStreamEvent(
                                 type="message_delta",
                                 delta=AnthropicDelta(stop_reason=stop_reason),
                                 usage=AnthropicUsage(
-                                    input_tokens=origin_chunk.usage.prompt_tokens
-                                    if origin_chunk.usage
-                                    else 0,
+                                    input_tokens=delta_input_tokens,
                                     output_tokens=origin_chunk.usage.completion_tokens
                                     if origin_chunk.usage
                                     else 0,
+                                    cache_read_input_tokens=delta_cache_read,
                                 ),
                             )
                             data = chunk.model_dump_json(exclude_unset=True)
