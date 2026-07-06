@@ -8,6 +8,12 @@ from vllm.platforms import current_platform
 from vllm.scalar_type import scalar_types
 from vllm.triton_utils import tl, triton
 
+# Resolved once at import time: has_device_capability round-trips through
+# pynvml init/shutdown (expensive) and torch.compile can't trace through
+# it, so it must be a plain constant rather than a call inside a
+# compiled/traced forward path.
+_HAS_FP8E4NV = current_platform.has_device_capability(89)
+
 __all__ = [
     "break_fp4_bytes",
     "dequantize_to_dtype",
@@ -84,12 +90,11 @@ def _dequantize_nvfp4_kernel(
     block_offsets = tl.arange(0, TILE_BLOCKS)
     block_mask = (start_block + block_offsets) < num_blocks
 
-    raw_scales = tl.load(
+    scale_f32 = tl.load(
         scale_ptr + scale_row_offset + start_block + block_offsets,
         mask=block_mask,
-        other=0,
+        other=0.0,
     )
-    scale_f32 = tl.cast(raw_scales, tl.float8e4nv, bitcast=True).to(tl.float32)
     scale_values = (scale_f32 * global_scale)[:, None]
 
     # Load [TILE_BLOCKS, BLOCK_PACKED] packed bytes
@@ -169,6 +174,7 @@ def _nvfp4_quant_dequant_kernel(
     BLOCK_SIZE: tl.constexpr,
     FP4_MAX_RECIPROCAL: tl.constexpr,
     TILE_BLOCKS: tl.constexpr,
+    HAS_FP8E4NV: tl.constexpr,
 ):
     """Fused NVFP4 quantize-dequantize kernel.
 
@@ -198,7 +204,12 @@ def _nvfp4_quant_dequant_kernel(
     vec_max = tl.max(tl.abs(x), axis=1)
     scale = global_scale * (vec_max * FP4_MAX_RECIPROCAL)
     scale = tl.clamp(scale, -448.0, 448.0)
-    scale = scale.to(tl.float8e4nv).to(tl.float32)
+    if HAS_FP8E4NV:
+        # Round-trip through e4m3 to match real NVFP4 hardware's 8-bit
+        # scale precision. Only sm_89+ has this Triton type; older GPUs
+        # (which have no NVFP4 hardware to emulate the loss of anyway)
+        # skip the round-trip and keep the fp32 scale.
+        scale = scale.to(tl.float8e4nv).to(tl.float32)
 
     # Safe reciprocal, broadcast to [TILE_BLOCKS, 1]
     output_scale = tl.where(scale == 0.0, 0.0, global_scale / scale)[:, None]
@@ -244,6 +255,7 @@ def _triton_nvfp4_quant_dequant(
         block_size,
         FLOAT4_E2M1_MAX_RECIPROCAL,
         tile_blocks,
+        _HAS_FP8E4NV,
     )
 
     return output
@@ -281,8 +293,14 @@ def _triton_dequantize_nvfp4(
 
     output = torch.empty(total_rows_flat, k, dtype=dtype, device=tensor_fp4.device)
 
-    # View as uint8 so Triton can load raw bytes and bitcast to float8_e4m3fn
-    scale_raw = tensor_sf_2d.contiguous().view(torch.uint8)
+    # Decode the e4m3fn scale to fp32 in PyTorch (works on any GPU) rather
+    # than via tl.float8e4nv inside the kernel, which Triton only supports
+    # on >=sm_89 hardware. Callers pass this either as raw uint8 bytes
+    # (needs a bit-reinterpret first) or as an already-float8_e4m3fn tensor.
+    tensor_sf_2d = tensor_sf_2d.contiguous()
+    if tensor_sf_2d.dtype == torch.uint8:
+        tensor_sf_2d = tensor_sf_2d.view(torch.float8_e4m3fn)
+    scale_raw = tensor_sf_2d.to(torch.float32)
 
     # Shape-adaptive tile sizing: for large row counts (3D), process
     # entire row in one tile. For small row counts (2D), use smaller

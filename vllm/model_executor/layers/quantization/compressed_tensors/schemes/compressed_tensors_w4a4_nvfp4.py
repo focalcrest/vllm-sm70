@@ -30,7 +30,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsScheme):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        return 75
+        # SM70 has no native FP4 tensor core; gate loosened so the
+        # always-available EmulationNvFp4LinearKernel can be selected there.
+        return 70
 
     def create_weights(
         self,
