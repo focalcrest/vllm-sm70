@@ -46,22 +46,34 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 if current_platform.is_cuda():
-    from humming.dtypes import DataType
-    from humming.layer import HummingMethod
-    from humming.schema import (
-        BaseInputSchema,
-        BaseWeightSchema,
-        HummingInputSchema,
-        HummingWeightSchema,
-    )
-    from humming.utils.weight import quantize_weight
+    try:
+        from humming.dtypes import DataType
+        from humming.layer import HummingMethod
+        from humming.schema import (
+            BaseInputSchema,
+            BaseWeightSchema,
+            HummingInputSchema,
+            HummingWeightSchema,
+        )
+        from humming.utils.weight import quantize_weight
 
-    from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
-        BatchedHummingGroupedExperts,
-        HummingGroupedExperts,
-        HummingIndexedExperts,
-        get_humming_moe_gemm_type,
-    )
+        from vllm.model_executor.layers.fused_moe.experts.fused_humming_moe import (
+            BatchedHummingGroupedExperts,
+            HummingGroupedExperts,
+            HummingIndexedExperts,
+            get_humming_moe_gemm_type,
+        )
+    except ModuleNotFoundError:
+        # `humming` is an internal/unreleased package not installed in this
+        # env. Only actually needed when --quantization=humming is selected;
+        # every other quant method's override-detection probe still imports
+        # this module, so degrade to None instead of hard-failing here.
+        DataType = HummingMethod = None
+        BaseInputSchema = BaseWeightSchema = None
+        HummingInputSchema = HummingWeightSchema = None
+        quantize_weight = None
+        BatchedHummingGroupedExperts = HummingGroupedExperts = None
+        HummingIndexedExperts = get_humming_moe_gemm_type = None
 
 if TYPE_CHECKING:
     from humming.schema import (
