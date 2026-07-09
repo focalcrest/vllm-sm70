@@ -2016,6 +2016,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_BFLA_MIN_LEN": lambda: os.getenv("VLLM_SM70_BFLA_MIN_LEN", "8192"),
     "VLLM_SM70_BFLA_NLOCAL": lambda: os.getenv("VLLM_SM70_BFLA_NLOCAL", "8"),
     "VLLM_SM70_BFLA_DEBUG": lambda: os.getenv("VLLM_SM70_BFLA_DEBUG", "0"),
+    # SM70 decode-path tuning (see entrypoint.sh in vllm-sm70-docker).
+    "VLLM_SM70_PARTITIONED_DECODE": lambda: os.getenv(
+        "VLLM_SM70_PARTITIONED_DECODE", "1"
+    ),
+    "VLLM_SM70_FLASH_ATTN_DECODE_NUM_SPLITS": lambda: os.getenv(
+        "VLLM_SM70_FLASH_ATTN_DECODE_NUM_SPLITS"
+    ),
+    "VLLM_SM70_ENABLE_DENSE_F16_FASTPATH": lambda: os.getenv(
+        "VLLM_SM70_ENABLE_DENSE_F16_FASTPATH", "0"
+    ),
+    "VLLM_SM70_FASTPATH_FORCE_DECODE": lambda: os.getenv(
+        "VLLM_SM70_FASTPATH_FORCE_DECODE", "0"
+    ),
 }
 
 
